@@ -52,10 +52,17 @@ struct KaniSequenceFunctionRenderer<'a, 'tcx> {
     initialized_symbolic_params: BTreeSet<SymbolicParamKey>,
     materialized_param_values: HashMap<(usize, String), String>,
     uses_pyo3_python_token: bool,
+    fallible_output_policy: FallibleOutputPolicy,
 }
 
 pub(super) struct KaniBackend;
 pub(super) static KANI_BACKEND: KaniBackend = KaniBackend;
+
+#[derive(Clone, Copy)]
+pub(super) enum FallibleOutputPolicy {
+    Panic,
+    ReturnNone,
+}
 
 impl SuiteBackend for KaniBackend {
     fn kind(&self) -> BackendKind {
@@ -183,7 +190,25 @@ pub(super) fn render_kani_seeded_sequence_function<'tcx>(
     suite: &SynthesizedSuite<'tcx>,
     index: usize,
 ) -> RenderedSequenceFunction<KaniParam<'tcx>> {
-    let mut renderer = KaniSequenceFunctionRenderer::new(tcx, graph);
+    render_kani_seeded_sequence_function_with_policy(
+        tcx,
+        graph,
+        dependency_crate,
+        suite,
+        index,
+        FallibleOutputPolicy::Panic,
+    )
+}
+
+pub(super) fn render_kani_seeded_sequence_function_with_policy<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    graph: &crate::rapx_graph::ApiDependencyGraph<'tcx>,
+    dependency_crate: &str,
+    suite: &SynthesizedSuite<'tcx>,
+    index: usize,
+    fallible_output_policy: FallibleOutputPolicy,
+) -> RenderedSequenceFunction<KaniParam<'tcx>> {
+    let mut renderer = KaniSequenceFunctionRenderer::new(tcx, graph, fallible_output_policy);
     render_sequence_function(&mut renderer, dependency_crate, suite, index)
 }
 
@@ -198,7 +223,11 @@ impl SequenceFunctionParam for KaniParam<'_> {
 }
 
 impl<'a, 'tcx> KaniSequenceFunctionRenderer<'a, 'tcx> {
-    fn new(tcx: TyCtxt<'tcx>, graph: &'a crate::rapx_graph::ApiDependencyGraph<'tcx>) -> Self {
+    fn new(
+        tcx: TyCtxt<'tcx>,
+        graph: &'a crate::rapx_graph::ApiDependencyGraph<'tcx>,
+        fallible_output_policy: FallibleOutputPolicy,
+    ) -> Self {
         Self {
             tcx,
             graph,
@@ -206,6 +235,7 @@ impl<'a, 'tcx> KaniSequenceFunctionRenderer<'a, 'tcx> {
             initialized_symbolic_params: BTreeSet::new(),
             materialized_param_values: HashMap::new(),
             uses_pyo3_python_token: false,
+            fallible_output_policy,
         }
     }
 }
@@ -258,7 +288,7 @@ impl<'tcx> SequenceFunctionRenderer<'tcx> for KaniSequenceFunctionRenderer<'_, '
     }
 
     fn adapt_call_output(&self, adapter: OutputAdapter, call: String) -> String {
-        adapt_call_output(adapter, call)
+        adapt_call_output(adapter, call, self.fallible_output_policy)
     }
 
     fn wrap_body_lines(&self, body_lines: Vec<String>) -> Vec<String> {
@@ -305,15 +335,29 @@ mod tests {
     }
 }
 
-fn adapt_call_output(adapter: OutputAdapter, call: String) -> String {
+fn adapt_call_output(
+    adapter: OutputAdapter,
+    call: String,
+    fallible_output_policy: FallibleOutputPolicy,
+) -> String {
     match adapter {
         OutputAdapter::Plain => call,
-        OutputAdapter::Option => format!(
-            "match {call} {{ ::core::option::Option::Some(value) => value, ::core::option::Option::None => panic!(\"fallible API returned None\"), }}"
-        ),
-        OutputAdapter::Result => format!(
-            "match {call} {{ ::core::result::Result::Ok(value) => value, ::core::result::Result::Err(_) => panic!(\"fallible API returned Err\"), }}"
-        ),
+        OutputAdapter::Option => match fallible_output_policy {
+            FallibleOutputPolicy::Panic => format!(
+                "match {call} {{ ::core::option::Option::Some(value) => value, ::core::option::Option::None => panic!(\"fallible API returned None\"), }}"
+            ),
+            FallibleOutputPolicy::ReturnNone => format!(
+                "match {call} {{ ::core::option::Option::Some(value) => value, ::core::option::Option::None => return ::core::option::Option::None, }}"
+            ),
+        },
+        OutputAdapter::Result => match fallible_output_policy {
+            FallibleOutputPolicy::Panic => format!(
+                "match {call} {{ ::core::result::Result::Ok(value) => value, ::core::result::Result::Err(_) => panic!(\"fallible API returned Err\"), }}"
+            ),
+            FallibleOutputPolicy::ReturnNone => format!(
+                "match {call} {{ ::core::result::Result::Ok(value) => value, ::core::result::Result::Err(_) => return ::core::option::Option::None, }}"
+            ),
+        },
     }
 }
 

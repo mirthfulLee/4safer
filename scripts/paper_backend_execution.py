@@ -34,6 +34,9 @@ DEFAULT_VARIES_KANI_DIR = Path(
 if not DEFAULT_VARIES_KANI_DIR.exists():
     DEFAULT_VARIES_KANI_DIR = REPO / "tmp/paper-experiments/tools/varies_kani"
 BACKENDS = ("tests", "fuzz", "kani")
+AFL_LEGACY_SAFE_SEED_GUARD = '        if data == b"\\0" {\n            return;\n        }\n'
+AFL_FUZZ_ENTRY = "    afl::fuzz!(|data: &[u8]| {\n"
+FUZZ_SEED_VALIDATION_TIMEOUT = 5
 
 
 def main():
@@ -233,13 +236,14 @@ def run_backend(generation, args):
     if args.backend == "fuzz":
         if args.dry_run:
             for target in fuzz_targets(harness, args.fuzz_targets):
+                input_dir = prepared_fuzz_input_dir(run_dir, target)
                 print(" ".join(afl_build_command(manifest, target)))
                 print(
                     " ".join(
                         fuzz_target_command(
                             target,
                             args,
-                            harness,
+                            input_dir,
                             run_dir / "targets" / target / "afl-out",
                             target_dir,
                         )
@@ -372,10 +376,11 @@ def backend_command(args, manifest):
         ]
     if args.backend == "fuzz":
         targets = fuzz_targets(manifest.parent, args.fuzz_targets)
+        input_dir = prepared_fuzz_input_dir(manifest.parent, targets[0])
         return fuzz_target_command(
             targets[0],
             args,
-            manifest.parent,
+            input_dir,
             manifest.parent / "afl-out",
             manifest.parent / "target",
         )
@@ -508,8 +513,8 @@ def fuzz_targets(harness, mode):
     return targets
 
 
-def fuzz_input_dir(harness, target):
-    return harness / "corpus" / target
+def prepared_fuzz_input_dir(run_dir, target):
+    return run_dir / "targets" / target / "afl-in"
 
 
 def afl_build_command(manifest, target):
@@ -525,14 +530,14 @@ def afl_build_command(manifest, target):
     ]
 
 
-def fuzz_target_command(target, args, harness, output_dir, target_dir):
+def fuzz_target_command(target, args, input_dir, output_dir, target_dir):
     binary = target_dir / "debug" / target
     return [
         "cargo",
         "afl",
         "fuzz",
         "-i",
-        str(fuzz_input_dir(harness, target)),
+        str(input_dir),
         "-o",
         str(output_dir),
         "-V",
@@ -542,18 +547,159 @@ def fuzz_target_command(target, args, harness, output_dir, target_dir):
     ]
 
 
+def prepare_afl_input_dir(input_dir, valid_seed_results):
+    if input_dir.exists():
+        shutil.rmtree(input_dir)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    for index, seed_result in enumerate(valid_seed_results):
+        seed_name = f"seed_{index}_{safe_log_stem(seed_result['name'])}"
+        (input_dir / seed_name).write_bytes(bytes.fromhex(seed_result["hex"]))
+
+
+def remove_legacy_fuzz_target_safe_seed_guard(harness, target):
+    target_path = harness / "fuzz_targets" / f"{target}.rs"
+    source = target_path.read_text(encoding="utf-8")
+    if AFL_LEGACY_SAFE_SEED_GUARD not in source:
+        return False
+    target_path.write_text(source.replace(AFL_LEGACY_SAFE_SEED_GUARD, "", 1), encoding="utf-8")
+    return True
+
+
+def fuzz_target_min_data_len(harness, target):
+    target_path = harness / "fuzz_targets" / f"{target}.rs"
+    source = target_path.read_text(encoding="utf-8")
+    matches = [int(value) for value in re.findall(r"if data\.len\(\) < (\d+) \{", source)]
+    if not matches:
+        return 0
+    return max(matches)
+
+
+def fuzz_usize_byte_width(harness):
+    support_path = harness / "src" / "lib.rs"
+    if not support_path.exists():
+        return 8
+    source = support_path.read_text(encoding="utf-8")
+    for helper, width in (
+        ("_to_u8(data, index) as usize", 1),
+        ("_to_u16(data, index) as usize", 2),
+        ("_to_u32(data, index) as usize", 4),
+        ("_to_u64(data, index) as usize", 8),
+        ("_to_u128(data, index) as usize", 16),
+    ):
+        if helper in source:
+            return width
+    return 8
+
+
+def fuzz_target_usize_offsets(source):
+    return sorted({int(value) for value in re.findall(r"_to_usize\(data,\s*(\d+)\)", source)})
+
+
+def write_little_endian_usize(seed, offset, value, width):
+    if offset >= len(seed):
+        return
+    encoded = int(value).to_bytes(width, byteorder="little", signed=False)
+    end = min(len(seed), offset + width)
+    seed[offset:end] = encoded[: end - offset]
+
+
+def structured_fuzz_seed_candidates(harness, target, required_len):
+    target_path = harness / "fuzz_targets" / f"{target}.rs"
+    source = target_path.read_text(encoding="utf-8")
+    usize_offsets = fuzz_target_usize_offsets(source)
+    usize_width = fuzz_usize_byte_width(harness)
+    candidates = []
+
+    for name, fill, usize_value in (("all_one", 1, None), ("ascii", 65, None)):
+        data = bytearray([fill] * required_len)
+        candidates.append((name, bytes(data)))
+
+    for usize_value in (1, 2, 3, 4, 8):
+        for fill_name, fill in (("zero", 0), ("ascii", 65)):
+            data = bytearray([fill] * required_len)
+            for offset in usize_offsets:
+                write_little_endian_usize(data, offset, usize_value, usize_width)
+            candidates.append((f"{fill_name}_usize_{usize_value}", bytes(data)))
+
+    return candidates
+
+
+def fuzz_seed_candidates(harness, target):
+    target_path = harness / "fuzz_targets" / f"{target}.rs"
+    source = target_path.read_text(encoding="utf-8")
+    matches = [int(value) for value in re.findall(r"if data\.len\(\) < (\d+) \{", source)]
+    min_data_len = max(matches) if matches else 0
+    required_len = max(1, min_data_len)
+    candidates = [("zero", bytes(required_len))]
+    if required_len > 1:
+        candidates.append(("one", bytes([1]) + bytes(required_len - 1)))
+    candidates.extend(structured_fuzz_seed_candidates(harness, target, required_len))
+
+    corpus_dir = harness / "corpus" / target
+    if corpus_dir.exists():
+        for path in sorted(corpus_dir.iterdir()):
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+            if len(data) >= min_data_len and data:
+                candidates.append((f"corpus_{path.name}", data))
+
+    deduped = []
+    seen = set()
+    for name, data in candidates:
+        if data in seen:
+            continue
+        seen.add(data)
+        deduped.append((name, data))
+    return min_data_len, deduped
+
+
+def validate_fuzz_seed_candidates(binary, harness, env, candidates):
+    validation_results = []
+    valid_results = []
+    command = direct_fuzz_binary_command(binary)
+    for name, data in candidates:
+        exit_code, stdout, stderr, timed_out = run_command_with_stdin_capture(
+            command,
+            cwd=harness,
+            env=env,
+            stdin_bytes=data,
+            timeout=FUZZ_SEED_VALIDATION_TIMEOUT,
+        )
+        status = "timeout" if timed_out else "ok" if exit_code == 0 else "crash"
+        row = {
+            "name": name,
+            "len": len(data),
+            "hex": data.hex(),
+            "status": status,
+            "exit_code": exit_code,
+            "stdout_tail": decode_tail(stdout),
+            "stderr_tail": decode_tail(stderr),
+        }
+        validation_results.append(row)
+        if status == "ok":
+            valid_results.append(row)
+    return validation_results, valid_results
+
+
+def direct_fuzz_binary_command(binary):
+    return ["bash", "-lc", 'ulimit -c 0; exec "$1"', "bash", str(binary)]
+
+
 def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
     started = time.monotonic()
     targets = fuzz_targets(harness, args.fuzz_targets)
     run_targets = []
     for target in targets:
+        input_dir = prepared_fuzz_input_dir(run_dir, target)
         output_dir = run_dir / "targets" / target / "afl-out"
-        command = fuzz_target_command(target, args, harness, output_dir, run_dir / "target")
+        command = fuzz_target_command(target, args, input_dir, output_dir, run_dir / "target")
         run_targets.append(
             {
                 "name": target,
                 "build_command": afl_build_command(manifest, target),
                 "command": command,
+                "afl_input_dir": str(input_dir),
                 "afl_output_dir": str(output_dir),
                 "stdout_log": str(run_dir / "targets" / target / "stdout.log"),
                 "stderr_log": str(run_dir / "targets" / target / "stderr.log"),
@@ -572,6 +718,8 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
                     command
                     for target in run_targets
                     for command in (
+                        f"mkdir -p {target['afl_input_dir']}",
+                        "# AFL input seeds are validated and written by paper_backend_execution.py",
                         " ".join(target["build_command"]),
                         " ".join(target["command"]),
                     )
@@ -672,18 +820,25 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
     target_name = target["name"]
     build_command = target["build_command"]
     command = target["command"]
-    fuzz_input_dir(harness, target_name).mkdir(parents=True, exist_ok=True)
+    legacy_safe_seed_guard_removed = remove_legacy_fuzz_target_safe_seed_guard(harness, target_name)
+    input_dir = Path(target["afl_input_dir"])
     afl_output_dir = Path(target["afl_output_dir"])
     target_dir = run_dir / "targets" / target_name
     target_dir.mkdir(parents=True, exist_ok=True)
+    binary = run_dir / "target" / "debug" / target_name
     stdout_path = target_dir / "stdout.log"
     stderr_path = target_dir / "stderr.log"
     started = time.monotonic()
     status = "ok"
     build_exit_code = 0
-    fuzz_exit_code = 0
+    fuzz_exit_code = None
     exit_code = 0
     fuzz_ran = False
+    seed_min_data_len = None
+    seed_validation_results = []
+    valid_seed_results = []
+    seed_validation_failed = False
+    seed_validation_error = None
     try:
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
             write_log(stdout, f"\n[paper-backend-execution] running {' '.join(build_command)}\n", None)
@@ -700,20 +855,44 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
                 status = "fail"
                 exit_code = build_exit_code
             else:
-                write_log(stdout, f"\n[paper-backend-execution] running {' '.join(command)}\n", None)
-                fuzz_ran = True
-                completed = run_command(
-                    command,
-                    cwd=harness,
-                    env=env,
-                    stdout=stdout,
-                    stderr=stderr,
-                    timeout=args.fuzz_target_timeout,
+                seed_min_data_len, seed_candidates = fuzz_seed_candidates(harness, target_name)
+                seed_validation_results, valid_seed_results = validate_fuzz_seed_candidates(
+                    binary, harness, env, seed_candidates
                 )
-                fuzz_exit_code = completed.returncode
-                exit_code = fuzz_exit_code
-                if fuzz_exit_code != 0:
+                write_log(
+                    stdout,
+                    (
+                        "\n[paper-backend-execution] validated "
+                        f"{len(valid_seed_results)}/{len(seed_validation_results)} AFL seeds "
+                        f"for {target_name} (min_data_len={seed_min_data_len})\n"
+                    ),
+                    None,
+                )
+                if not valid_seed_results:
                     status = "fail"
+                    exit_code = 1
+                    seed_validation_failed = True
+                    seed_validation_error = (
+                        f"{target_name}: no non-crashing AFL seed candidate "
+                        f"(min_data_len={seed_min_data_len})"
+                    )
+                    write_log(stdout, f"[paper-backend-execution] {seed_validation_error}\n", None)
+                else:
+                    prepare_afl_input_dir(input_dir, valid_seed_results)
+                    write_log(stdout, f"\n[paper-backend-execution] running {' '.join(command)}\n", None)
+                    fuzz_ran = True
+                    completed = run_command(
+                        command,
+                        cwd=harness,
+                        env=env,
+                        stdout=stdout,
+                        stderr=stderr,
+                        timeout=args.fuzz_target_timeout,
+                    )
+                    fuzz_exit_code = completed.returncode
+                    exit_code = fuzz_exit_code
+                    if fuzz_exit_code != 0:
+                        status = "fail"
     except subprocess.TimeoutExpired:
         status = "timeout"
         exit_code = -999
@@ -735,15 +914,22 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
         "elapsed_sec": round(time.monotonic() - started, 3),
         "build_command": build_command,
         "command": command,
+        "afl_input_dir": str(input_dir),
         "afl_output_dir": str(afl_output_dir),
         "stdout_log": str(stdout_path),
         "stderr_log": str(stderr_path),
         "stdout_tail": stdout_tail,
         "stderr_tail": stderr_tail,
-        "first_error": first_error(stderr_path) or first_error(stdout_path),
+        "first_error": seed_validation_error or first_error(stderr_path) or first_error(stdout_path),
         "fuzz_execs_done": read_afl_stat(afl_output_dir, "execs_done"),
         "fuzz_crash_count": crash_count,
         "crash_detected": crash_detected,
+        "legacy_safe_seed_guard_removed": legacy_safe_seed_guard_removed,
+        "seed_min_data_len": seed_min_data_len,
+        "seed_candidates": len(seed_validation_results),
+        "seed_valid": len(valid_seed_results),
+        "seed_validation_failed": seed_validation_failed,
+        "seed_validation_results": seed_validation_results,
     }
 
 
@@ -848,6 +1034,7 @@ def run_tests_backend(generation, args, run_dir, harness, env, command):
     status = "ok"
     test_results = []
     binary = None
+    suite_deadline = suite_deadline_from_timeout(started, args.timeout)
     available_test_names = generated_test_names(harness)
     if args.max_tests_per_crate > 0:
         test_names = available_test_names[: args.max_tests_per_crate]
@@ -862,28 +1049,32 @@ def run_tests_backend(generation, args, run_dir, harness, env, command):
             test_results = run_generated_tests(
                 test_names,
                 args.test_jobs,
-                lambda test_name: run_one_generated_test_with_miri(
+                lambda test_name, timeout: run_one_generated_test_with_miri(
                     command,
                     test_name,
                     harness,
                     env,
                     stdout,
                     stderr,
-                    args.test_timeout,
+                    timeout,
                     test_log_dir,
                     log_lock,
                 ),
+                suite_deadline,
+                args.test_timeout,
+                test_log_dir,
             )
             status = first_non_ok_status(test_results) or status
         else:
             try:
+                compile_timeout = remaining_suite_timeout(suite_deadline)
                 completed = run_command(
                     command,
                     cwd=harness,
                     env=env,
                     stdout=stdout,
                     stderr=stderr,
-                    timeout=args.timeout,
+                    timeout=compile_timeout,
                 )
                 compile_exit_code = completed.returncode
             except subprocess.TimeoutExpired:
@@ -902,17 +1093,20 @@ def run_tests_backend(generation, args, run_dir, harness, env, command):
                     test_results = run_generated_tests(
                         test_names,
                         args.test_jobs,
-                        lambda test_name: run_one_generated_test(
+                        lambda test_name, timeout: run_one_generated_test(
                             binary,
                             test_name,
                             harness,
                             env,
                             stdout,
                             stderr,
-                            args.test_timeout,
+                            timeout,
                             test_log_dir,
                             log_lock,
                         ),
+                        suite_deadline,
+                        args.test_timeout,
+                        test_log_dir,
                     )
                     status = first_non_ok_status(test_results) or status
             elif status != "timeout":
@@ -960,19 +1154,65 @@ def run_tests_backend(generation, args, run_dir, harness, env, command):
     return result
 
 
-def run_generated_tests(test_names, test_jobs, run_one):
+def suite_deadline_from_timeout(started, timeout):
+    if timeout is None or timeout <= 0:
+        return None
+    return started + timeout
+
+
+def remaining_suite_timeout(deadline):
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def bounded_test_timeout(test_timeout, deadline):
+    remaining = remaining_suite_timeout(deadline)
+    if remaining is None:
+        return test_timeout
+    if test_timeout is None or test_timeout <= 0:
+        return remaining
+    return min(test_timeout, remaining)
+
+
+def suite_timeout_result(test_name, log_dir):
+    return test_result_row(
+        test_name,
+        "timeout",
+        -999,
+        0.0,
+        b"",
+        b"[paper-backend-execution] suite timeout before running this generated test\n",
+        log_dir,
+    )
+
+
+def run_generated_tests(test_names, test_jobs, run_one, deadline=None, test_timeout=0, log_dir=None):
     if test_jobs <= 1 or len(test_names) <= 1:
-        return [run_one(test_name) for test_name in test_names]
+        results = []
+        for index, test_name in enumerate(test_names):
+            timeout = bounded_test_timeout(test_timeout, deadline)
+            if timeout is not None and timeout <= 0:
+                results.extend(suite_timeout_result(name, log_dir) for name in test_names[index:])
+                break
+            results.append(run_one(test_name, timeout))
+        return results
 
     results = [None] * len(test_names)
     with ThreadPoolExecutor(max_workers=test_jobs) as executor:
-        futures = {
-            executor.submit(run_one, test_name): index
-            for index, test_name in enumerate(test_names)
-        }
+        futures = {}
+        for index, test_name in enumerate(test_names):
+            timeout = bounded_test_timeout(test_timeout, deadline)
+            if timeout is not None and timeout <= 0:
+                results[index] = suite_timeout_result(test_name, log_dir)
+                continue
+            futures[executor.submit(run_one, test_name, timeout)] = index
         for future in as_completed(futures):
             results[futures[future]] = future.result()
-    return results
+    return [
+        result if result is not None else suite_timeout_result(test_names[index], log_dir)
+        for index, result in enumerate(results)
+    ]
 
 
 def first_non_ok_status(test_results):
@@ -1119,6 +1359,29 @@ def run_command_capture(command, cwd, env, timeout):
     )
     try:
         captured_stdout, captured_stderr = process.communicate(timeout=timeout)
+        return process.returncode, captured_stdout, captured_stderr, False
+    except subprocess.TimeoutExpired:
+        kill_process_group(process)
+        captured_stdout, captured_stderr = process.communicate()
+        return -999, captured_stdout, captured_stderr, True
+
+
+def run_command_with_stdin_capture(command, cwd, env, stdin_bytes, timeout):
+    if timeout is not None and timeout <= 0:
+        timeout = None
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        captured_stdout, captured_stderr = process.communicate(
+            input=stdin_bytes, timeout=timeout
+        )
         return process.returncode, captured_stdout, captured_stderr, False
     except subprocess.TimeoutExpired:
         kill_process_group(process)
@@ -1506,10 +1769,27 @@ def write_csv(path, rows):
         return
     fieldnames = sorted({key for row in rows for key in row})
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=fieldnames,
+            quoting=csv.QUOTE_MINIMAL,
+            quotechar='"',
+            escapechar="\\",
+            lineterminator="\n",
+        )
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            writer.writerow(sanitize_csv_row(row))
+
+
+def sanitize_csv_row(row):
+    return {key: sanitize_csv_value(value) for key, value in row.items()}
+
+
+def sanitize_csv_value(value):
+    if isinstance(value, str):
+        return value.replace("\0", "\\0")
+    return value
 
 
 def write_markdown_summary(path, rows, result_rows):

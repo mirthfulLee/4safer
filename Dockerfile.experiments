@@ -25,6 +25,7 @@ RUN apt-get update && \
       lld \
       llvm \
       llvm-dev \
+      nasm \
       ninja-build \
       pkg-config \
       procps \

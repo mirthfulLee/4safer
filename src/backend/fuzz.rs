@@ -2,12 +2,13 @@ use super::common::{
     dependency_crate_ident, prepare_generated_layout,
     render_harness_manifest_with_extra_dependencies, reset_lockfile, write_suite_metadata,
 };
-use super::kani::render_kani_seeded_sequence_function;
+use super::kani::{FallibleOutputPolicy, render_kani_seeded_sequence_function_with_policy};
 use super::sequence_fn::RenderedSequenceFunction;
 use super::{BackendKind, BackendRenderContext, BackendValidationCommand, SuiteBackend};
 use crate::cli::FourSaferArgs;
 use crate::std_adapters::{
-    fuzz_seed_byte_len_for_value_ty, render_fuzz_seed_from_data_for_value_ty,
+    fuzz_seed_byte_len_for_value_ty, fuzz_seed_corpus_for_value_tys,
+    render_fuzz_seed_from_data_for_value_ty,
 };
 use crate::synth::SynthesizedSuite;
 use crate::workspace::WorkspaceTarget;
@@ -113,11 +114,15 @@ fn write_suite_impl<'tcx>(
                 target_corpus_dir.display()
             )
         })?;
-        fs::write(
-            target_corpus_dir.join("seed"),
-            minimal_seed(rendered.min_data_len),
-        )
-        .with_context(|| format!("failed to write corpus seed for fuzz target {index}"))?;
+        for (seed_index, seed) in rendered.corpus.into_iter().enumerate() {
+            let seed_name = if seed_index == 0 {
+                "seed".to_owned()
+            } else {
+                format!("seed_{seed_index}")
+            };
+            fs::write(target_corpus_dir.join(seed_name), non_empty_seed(seed))
+                .with_context(|| format!("failed to write corpus seed for fuzz target {index}"))?;
+        }
     }
 
     write_suite_metadata(target, meta_dir, suite)?;
@@ -149,7 +154,7 @@ AFL_NO_AFFINITY = "1"
 
 struct RenderedFuzzTarget {
     source: String,
-    min_data_len: usize,
+    corpus: Vec<Vec<u8>>,
 }
 
 fn render_fuzz_target_file<'tcx>(
@@ -162,7 +167,14 @@ fn render_fuzz_target_file<'tcx>(
     let RenderedSequenceFunction {
         params,
         lines: function_lines,
-    } = render_kani_seeded_sequence_function(tcx, graph, dependency_crate, suite, index);
+    } = render_kani_seeded_sequence_function_with_policy(
+        tcx,
+        graph,
+        dependency_crate,
+        suite,
+        index,
+        FallibleOutputPolicy::ReturnNone,
+    );
     let mut param_lens = Vec::new();
     for param in &params {
         param_lens.push(
@@ -220,15 +232,19 @@ fn render_fuzz_target_file<'tcx>(
     ));
     lines.push("    });".to_owned());
     lines.push("}".to_owned());
+    let corpus = fuzz_seed_corpus_for_value_tys(tcx, params.iter().map(|param| param.value_ty))
+        .ok_or_else(|| format!("fuzz backend cannot render seed corpus for target {index}"))?;
     Ok(RenderedFuzzTarget {
         source: lines.join("\n"),
-        min_data_len: offset,
+        corpus,
     })
 }
 
-fn minimal_seed(min_data_len: usize) -> Vec<u8> {
-    let len = min_data_len.max(1);
-    (0..len).map(|index| index.wrapping_add(1) as u8).collect()
+fn non_empty_seed(mut seed: Vec<u8>) -> Vec<u8> {
+    if seed.is_empty() {
+        seed.push(0);
+    }
+    seed
 }
 
 fn render_fuzz_support_lib(tcx: TyCtxt<'_>) -> String {
