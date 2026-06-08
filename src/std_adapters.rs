@@ -5,6 +5,7 @@ use rustc_middle::ty::{self, AdtDef, GenericArgsRef, Ty, TyCtxt, TyKind, Variant
 use rustc_span::sym;
 
 const SYMBOLIC_COLLECTION_LEN: usize = 8;
+const COLLECTION_LENGTH_SEEDS: [usize; 6] = [0, 1, 2, 3, 4, SYMBOLIC_COLLECTION_LEN];
 const MAX_COMPOSITE_LITERAL_OPTIONS: usize = 6;
 const KANI_TUPLE_ARBITRARY_LIMIT: usize = 12;
 
@@ -110,6 +111,20 @@ pub fn render_fuzz_seed_from_data_for_value_ty<'tcx>(
         data_binding,
         start_index,
     )
+}
+
+/// Return a bounded deterministic corpus of byte buffers that decode through
+/// the same adapter path used by fuzz targets.
+pub fn fuzz_seed_corpus_for_value_tys<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    value_tys: impl IntoIterator<Item = Ty<'tcx>>,
+) -> Option<Vec<Vec<u8>>> {
+    let mut context = AdapterContext::new(tcx, None);
+    let seed_options = value_tys
+        .into_iter()
+        .map(|value_ty| context.fuzz_seed_bytes_for_value_ty(value_ty))
+        .collect::<Option<Vec<_>>>()?;
+    Some(combine_byte_seed_options(&seed_options))
 }
 
 /// Return a bounded set of common std/core value types that can be rebuilt
@@ -1012,6 +1027,223 @@ impl<'tcx, 'graph> AdapterContext<'tcx, 'graph> {
         }
     }
 
+    fn fuzz_seed_bytes_for_value_ty(&mut self, value_ty: Ty<'tcx>) -> Option<Vec<Vec<u8>>> {
+        if is_std_io_empty_value_ty(value_ty, self.tcx)
+            || is_std_io_sink_value_ty(value_ty, self.tcx)
+        {
+            return Some(vec![Vec::new()]);
+        }
+        if is_std_io_repeat_value_ty(value_ty, self.tcx) {
+            return Some(vec![vec![0], vec![1]]);
+        }
+        if let Some(inner) = cursor_inner_ty(value_ty, self.tcx) {
+            return self.fuzz_seed_bytes_for_value_ty(inner);
+        }
+        if is_symbolic_string_value_ty(value_ty, self.tcx) {
+            return Some(self.length_prefixed_u8_seed_bytes());
+        }
+        if let Some(inner) = symbolic_vec_inner_ty(value_ty, self.tcx) {
+            let inner_values = self.fuzz_seed_bytes_for_value_ty(inner)?;
+            return Some(
+                self.length_prefixed_array_seed_bytes(&inner_values, SYMBOLIC_COLLECTION_LEN),
+            );
+        }
+        if let Some(inner) = boxed_inner_ty(value_ty, self.tcx) {
+            return self.fuzz_seed_bytes_for_value_ty(inner);
+        }
+        if let Some((inner, _)) = option_inner_ty(value_ty, self.tcx) {
+            let inner_values = self.fuzz_seed_bytes_for_value_ty(inner)?;
+            let mut options = Vec::new();
+            if let Some(first) = inner_values.first() {
+                push_unique_bytes(&mut options, prefixed_seed_byte(0, first));
+            }
+            for value in pick_byte_seed_variants(&inner_values, 2) {
+                push_unique_bytes(&mut options, prefixed_seed_byte(1, &value));
+            }
+            return Some(options);
+        }
+        if let Some(((ok_ty, err_ty), _)) = result_inner_tys(value_ty, self.tcx) {
+            let ok_values = self.fuzz_seed_bytes_for_value_ty(ok_ty)?;
+            let err_values = self.fuzz_seed_bytes_for_value_ty(err_ty)?;
+            let mut options = Vec::new();
+            for value in pick_byte_seed_variants(&ok_values, 2) {
+                push_unique_bytes(&mut options, prefixed_seed_byte(0, &value));
+            }
+            for value in pick_byte_seed_variants(&err_values, 2) {
+                push_unique_bytes(&mut options, prefixed_seed_byte(1, &value));
+            }
+            return Some(options);
+        }
+        if let TyKind::Tuple(types) = value_ty.kind() {
+            let element_values = types
+                .iter()
+                .map(|ty| self.fuzz_seed_bytes_for_value_ty(ty))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(combine_byte_seed_options(&element_values));
+        }
+        if let TyKind::Slice(inner) = value_ty.kind() {
+            let inner_values = self.fuzz_seed_bytes_for_value_ty(*inner)?;
+            return Some(
+                self.length_prefixed_array_seed_bytes(&inner_values, SYMBOLIC_COLLECTION_LEN),
+            );
+        }
+        if let TyKind::Array(inner, len) = value_ty.kind() {
+            let inner_values = self.fuzz_seed_bytes_for_value_ty(*inner)?;
+            return Some(repeated_byte_array_seeds(
+                &inner_values,
+                self.array_len_value(*len)?,
+            ));
+        }
+        if let Some(enum_spec) = self.local_enum_spec(value_ty) {
+            let discriminants =
+                enum_discriminant_bytes(enum_spec.variants.len(), self.pointer_byte_len());
+            if enum_spec
+                .variants
+                .iter()
+                .all(|variant| variant.field_tys.is_empty())
+            {
+                return Some(discriminants);
+            }
+
+            let mut element_values = vec![discriminants];
+            for variant in enum_spec.variants {
+                let field_values = variant
+                    .field_tys
+                    .iter()
+                    .map(|ty| self.fuzz_seed_bytes_for_value_ty(*ty))
+                    .collect::<Option<Vec<_>>>()?;
+                element_values.push(combine_byte_seed_options(&field_values));
+            }
+            return Some(combine_byte_seed_options(&element_values));
+        }
+        if let Some(struct_spec) = self.local_struct_spec(value_ty) {
+            let field_values = struct_spec
+                .field_tys
+                .iter()
+                .map(|ty| self.fuzz_seed_bytes_for_value_ty(*ty))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(combine_byte_seed_options(&field_values));
+        }
+
+        self.scalar_fuzz_seed_bytes(value_ty)
+    }
+
+    fn length_prefixed_u8_seed_bytes(&self) -> Vec<Vec<u8>> {
+        let mut options = Vec::new();
+        let mut one = vec![0; SYMBOLIC_COLLECTION_LEN];
+        one[0] = b'a';
+        let full = vec![b'A'; SYMBOLIC_COLLECTION_LEN];
+        push_unique_bytes(
+            &mut options,
+            length_prefixed_bytes(vec![0; SYMBOLIC_COLLECTION_LEN], 0, self.pointer_byte_len()),
+        );
+        push_unique_bytes(
+            &mut options,
+            length_prefixed_bytes(one, 1, self.pointer_byte_len()),
+        );
+        for len in [2, 3, 4, SYMBOLIC_COLLECTION_LEN] {
+            push_unique_bytes(
+                &mut options,
+                length_prefixed_bytes(full.clone(), len, self.pointer_byte_len()),
+            );
+        }
+        options
+    }
+
+    fn length_prefixed_array_seed_bytes(&self, values: &[Vec<u8>], count: usize) -> Vec<Vec<u8>> {
+        let mut options = Vec::new();
+        let variants = pick_byte_seed_variants(values, 3);
+        if variants.is_empty() {
+            return options;
+        }
+        for (index, len) in COLLECTION_LENGTH_SEEDS.iter().enumerate() {
+            let value = &variants[index.min(variants.len() - 1)];
+            push_unique_bytes(
+                &mut options,
+                length_prefixed_bytes(
+                    repeat_seed_bytes(value, count),
+                    (*len).min(count),
+                    self.pointer_byte_len(),
+                ),
+            );
+        }
+        options
+    }
+
+    fn scalar_fuzz_seed_bytes(&self, value_ty: Ty<'tcx>) -> Option<Vec<Vec<u8>>> {
+        match value_ty.kind() {
+            TyKind::Bool => Some(vec![vec![0], vec![1]]),
+            TyKind::Char => Some(vec![
+                ('a' as u32).to_le_bytes().to_vec(),
+                0u32.to_le_bytes().to_vec(),
+                ('Z' as u32).to_le_bytes().to_vec(),
+            ]),
+            TyKind::Int(ty::IntTy::I8) => Some(vec![vec![0], vec![1], vec![u8::MAX]]),
+            TyKind::Uint(ty::UintTy::U8) => Some(vec![vec![0], vec![1], vec![u8::MAX]]),
+            TyKind::Int(ty::IntTy::I16) => Some(vec![
+                0i16.to_le_bytes().to_vec(),
+                1i16.to_le_bytes().to_vec(),
+                (-1i16).to_le_bytes().to_vec(),
+            ]),
+            TyKind::Uint(ty::UintTy::U16) => Some(vec![
+                0u16.to_le_bytes().to_vec(),
+                1u16.to_le_bytes().to_vec(),
+                u16::MAX.to_le_bytes().to_vec(),
+            ]),
+            TyKind::Int(ty::IntTy::I32) => Some(vec![
+                0i32.to_le_bytes().to_vec(),
+                1i32.to_le_bytes().to_vec(),
+                (-1i32).to_le_bytes().to_vec(),
+            ]),
+            TyKind::Uint(ty::UintTy::U32) => Some(vec![
+                0u32.to_le_bytes().to_vec(),
+                1u32.to_le_bytes().to_vec(),
+                u32::MAX.to_le_bytes().to_vec(),
+            ]),
+            TyKind::Int(ty::IntTy::I64) => Some(vec![
+                0i64.to_le_bytes().to_vec(),
+                1i64.to_le_bytes().to_vec(),
+                (-1i64).to_le_bytes().to_vec(),
+            ]),
+            TyKind::Uint(ty::UintTy::U64) => Some(vec![
+                0u64.to_le_bytes().to_vec(),
+                1u64.to_le_bytes().to_vec(),
+                u64::MAX.to_le_bytes().to_vec(),
+            ]),
+            TyKind::Int(ty::IntTy::I128) => Some(vec![
+                0i128.to_le_bytes().to_vec(),
+                1i128.to_le_bytes().to_vec(),
+                (-1i128).to_le_bytes().to_vec(),
+            ]),
+            TyKind::Uint(ty::UintTy::U128) => Some(vec![
+                0u128.to_le_bytes().to_vec(),
+                1u128.to_le_bytes().to_vec(),
+                u128::MAX.to_le_bytes().to_vec(),
+            ]),
+            TyKind::Int(ty::IntTy::Isize) => Some(vec![
+                signed_bytes(0, self.pointer_byte_len()),
+                signed_bytes(1, self.pointer_byte_len()),
+                signed_bytes(-1, self.pointer_byte_len()),
+            ]),
+            TyKind::Uint(ty::UintTy::Usize) => Some(vec![
+                unsigned_bytes(0, self.pointer_byte_len()),
+                unsigned_bytes(1, self.pointer_byte_len()),
+                unsigned_bytes(8, self.pointer_byte_len()),
+            ]),
+            TyKind::Float(ty::FloatTy::F32) => Some(vec![
+                0.0f32.to_le_bytes().to_vec(),
+                1.0f32.to_le_bytes().to_vec(),
+                (-1.0f32).to_le_bytes().to_vec(),
+            ]),
+            TyKind::Float(ty::FloatTy::F64) => Some(vec![
+                0.0f64.to_le_bytes().to_vec(),
+                1.0f64.to_le_bytes().to_vec(),
+                (-1.0f64).to_le_bytes().to_vec(),
+            ]),
+            _ => None,
+        }
+    }
+
     fn render_length_prefixed_fuzz_seed_array(
         &mut self,
         inner: Ty<'tcx>,
@@ -1532,6 +1764,128 @@ fn pick_literal_variants(values: &[String], max: usize) -> Vec<String> {
     }
     variants.truncate(max);
     variants
+}
+
+fn combine_byte_seed_options(elements: &[Vec<Vec<u8>>]) -> Vec<Vec<u8>> {
+    if elements.is_empty() {
+        return vec![Vec::new()];
+    }
+
+    let first = elements
+        .iter()
+        .map(|values| values[0].clone())
+        .collect::<Vec<_>>();
+    let second = elements
+        .iter()
+        .map(|values| values.get(1).cloned().unwrap_or_else(|| values[0].clone()))
+        .collect::<Vec<_>>();
+    let last = elements
+        .iter()
+        .map(|values| values.last().cloned().unwrap_or_else(|| values[0].clone()))
+        .collect::<Vec<_>>();
+
+    let mut options = Vec::new();
+    push_unique_bytes(&mut options, concat_seed_parts(&first));
+    push_unique_bytes(&mut options, concat_seed_parts(&second));
+    push_unique_bytes(&mut options, concat_seed_parts(&last));
+
+    for index in 0..elements.len() {
+        let mut variant = first.clone();
+        if let Some(last_value) = elements[index].last()
+            && *last_value != variant[index]
+        {
+            variant[index] = last_value.clone();
+            push_unique_bytes(&mut options, concat_seed_parts(&variant));
+        }
+        if options.len() >= MAX_COMPOSITE_LITERAL_OPTIONS {
+            break;
+        }
+    }
+
+    options.truncate(MAX_COMPOSITE_LITERAL_OPTIONS);
+    options
+}
+
+fn repeated_byte_array_seeds(values: &[Vec<u8>], count: usize) -> Vec<Vec<u8>> {
+    let mut options = Vec::new();
+    for value in pick_byte_seed_variants(values, 3) {
+        push_unique_bytes(&mut options, repeat_seed_bytes(&value, count));
+    }
+    options
+}
+
+fn enum_discriminant_bytes(variant_count: usize, pointer_len: usize) -> Vec<Vec<u8>> {
+    if variant_count == 0 {
+        return vec![unsigned_bytes(0, pointer_len)];
+    }
+
+    let mut options = Vec::new();
+    for index in 0..variant_count.min(4) {
+        push_unique_bytes(&mut options, unsigned_bytes(index as u128, pointer_len));
+    }
+    push_unique_bytes(
+        &mut options,
+        unsigned_bytes((variant_count - 1) as u128, pointer_len),
+    );
+    options
+}
+
+fn pick_byte_seed_variants(values: &[Vec<u8>], max: usize) -> Vec<Vec<u8>> {
+    let mut variants = Vec::new();
+    if let Some(first) = values.first() {
+        push_unique_bytes(&mut variants, first.clone());
+    }
+    if let Some(second) = values.get(1) {
+        push_unique_bytes(&mut variants, second.clone());
+    }
+    if let Some(last) = values.last() {
+        push_unique_bytes(&mut variants, last.clone());
+    }
+    variants.truncate(max);
+    variants
+}
+
+fn push_unique_bytes(values: &mut Vec<Vec<u8>>, value: Vec<u8>) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn concat_seed_parts(parts: &[Vec<u8>]) -> Vec<u8> {
+    let len = parts.iter().map(Vec::len).sum();
+    let mut seed = Vec::with_capacity(len);
+    for part in parts {
+        seed.extend(part);
+    }
+    seed
+}
+
+fn prefixed_seed_byte(prefix: u8, value: &[u8]) -> Vec<u8> {
+    let mut seed = Vec::with_capacity(1 + value.len());
+    seed.push(prefix);
+    seed.extend(value);
+    seed
+}
+
+fn repeat_seed_bytes(value: &[u8], count: usize) -> Vec<u8> {
+    let mut seed = Vec::with_capacity(value.len() * count);
+    for _ in 0..count {
+        seed.extend(value);
+    }
+    seed
+}
+
+fn length_prefixed_bytes(mut values: Vec<u8>, len: usize, pointer_len: usize) -> Vec<u8> {
+    values.extend(unsigned_bytes(len as u128, pointer_len));
+    values
+}
+
+fn unsigned_bytes(value: u128, len: usize) -> Vec<u8> {
+    value.to_le_bytes()[..len].to_vec()
+}
+
+fn signed_bytes(value: i128, len: usize) -> Vec<u8> {
+    value.to_le_bytes()[..len].to_vec()
 }
 
 fn push_unique_literal(values: &mut Vec<String>, value: String) {

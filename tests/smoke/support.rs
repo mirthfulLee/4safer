@@ -36,6 +36,16 @@ impl HarnessRun {
             .expect("generated harness lockfile should exist")
     }
 
+    pub(super) fn generated_fuzz_targets(&self) -> Vec<String> {
+        fs::read_dir(self.harness_dir.join("fuzz_targets"))
+            .expect("generated fuzz_targets dir should exist")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .map(|path| fs::read_to_string(path).expect("generated fuzz target should exist"))
+            .collect()
+    }
+
     pub(super) fn sequence_metadata(&self, crate_name: &str) -> Vec<SequenceMetadataView> {
         read_json(
             self.harness_dir

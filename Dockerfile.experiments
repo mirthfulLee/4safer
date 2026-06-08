@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1.7
+
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG RUST_TOOLCHAIN=nightly-2026-03-26
+ARG KANI_TOOLCHAIN=nightly-2025-10-23
+
+ENV RUSTUP_HOME=/data/huanli_home/.rustup
+ENV CARGO_HOME=/data/huanli_home/.cargo
+ENV CARGO_KANI_TOOLCHAIN=${KANI_TOOLCHAIN}-x86_64-unknown-linux-gnu
+ENV VARIES_KANI_DIR=/opt/varies_kani
+ENV PATH=/opt/varies_kani/scripts:/opt/varies_kani/target/kani/bin:/data/huanli_home/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN apt-get update && \
+    apt-get install --no-install-recommends --yes \
+      build-essential \
+      ca-certificates \
+      clang \
+      cmake \
+      curl \
+      file \
+      git \
+      libssl-dev \
+      lld \
+      llvm \
+      llvm-dev \
+      nasm \
+      ninja-build \
+      pkg-config \
+      procps \
+      psmisc \
+      python3 \
+      ripgrep \
+      time \
+      unzip \
+      xz-utils \
+      zlib1g \
+      zlib1g-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN printf '%s\n' \
+      '#!/usr/bin/env bash' \
+      'set -euo pipefail' \
+      'export HOME="${HOME:-/tmp/cargo-4safer-home}"' \
+      'mkdir -p "$HOME" "${XDG_CACHE_HOME:-$HOME/.cache}" "${XDG_DATA_HOME:-$HOME/.local/share}"' \
+      'exec "$@"' \
+      > /usr/local/bin/cargo-4safer-container-entrypoint && \
+    chmod +x /usr/local/bin/cargo-4safer-container-entrypoint
+
+WORKDIR /data/huanli/projects/4safer
+ENTRYPOINT ["/usr/local/bin/cargo-4safer-container-entrypoint"]
+CMD ["bash"]

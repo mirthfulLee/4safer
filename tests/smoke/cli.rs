@@ -82,6 +82,44 @@ fn cargo_4safer_accepts_budget_ablation_flag() {
 }
 
 #[test]
+fn cargo_4safer_fuzz_backend_treats_fallible_outputs_as_discarded_inputs() {
+    let run = run_4safer_on_fixture(
+        "unsafe-wrapper-multi-lib",
+        "unsafe-wrapper-multi-fuzz-fallible-harness",
+        true,
+        &["--backend", "fuzz"],
+    );
+    run.assert_success();
+
+    let fuzz_targets = run.generated_fuzz_targets();
+    assert!(
+        fuzz_targets.iter().any(|target| {
+            target.contains("unsafe_wrapper_multi_lib::Counter::recover(")
+                && target.contains("::core::result::Result::Ok(value) => value")
+                && target.contains(
+                    "::core::result::Result::Err(_) => return ::core::option::Option::None",
+                )
+        }),
+        "expected fuzz Result adapters to discard Err inputs instead of crashing"
+    );
+    assert!(
+        fuzz_targets.iter().any(|target| {
+            target.contains("unsafe_wrapper_multi_lib::Counter::restore(")
+                && target.contains("::core::option::Option::Some(value) => value")
+                && target
+                    .contains("::core::option::Option::None => return ::core::option::Option::None")
+        }),
+        "expected fuzz Option adapters to discard None inputs instead of crashing"
+    );
+    assert!(
+        fuzz_targets
+            .iter()
+            .all(|target| !target.contains("fallible API returned")),
+        "expected fuzz targets not to classify ordinary Err/None as crashes"
+    );
+}
+
+#[test]
 fn cargo_4safer_accepts_manifest_path() {
     let run = run_4safer_on_manifest("basic-lib", "manifest-harness", true, &[]);
     run.assert_success();
