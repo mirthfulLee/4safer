@@ -1,9 +1,12 @@
 /target
+/foursafer_test
+/fixtures/*/foursafer_test
 /fixtures/*/varies_test
 /fixtures/*/Cargo.lock
 /fixtures/*/target
 /fixtures/*/tmp
 /fixtures/*/.varies-test-output
+/fixtures/*/.foursafer-test-output
 /fixtures/*/rustc-ice-*.txt
 /tmp
 .omx/

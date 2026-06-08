@@ -1,8 +1,0 @@
-.git
-.omx
-.claude
-target
-tmp
-**/target
-**/.git
-**/.DS_Store

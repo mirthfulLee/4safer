@@ -4,8 +4,7 @@
 library crates. The project is the standalone extraction of the
 `obligation_driven` synthesis flow: target discovery is driven by MIR unsafe
 effect propagation, sequence planning is fixed to the obligation-driven planner,
-and generated metadata is written next to the harness crate for validation and
-experiments.
+and generated metadata is written next to the harness crate for validation.
 
 ## Status
 
@@ -32,6 +31,25 @@ presented as full precondition recovery.
 ## Usage
 
 Run `cargo 4safer -h` to see the full flag list.
+
+## Install
+
+`cargo-4safer` uses `rustc_private`, so install it with the pinned nightly and
+the matching `rustc-dev` component:
+
+```bash
+rustup toolchain install nightly-2026-03-26 --component rustc-dev
+cargo +nightly-2026-03-26 install \
+  --git git@github.com:mirthfulLee/4safer.git \
+  --branch master \
+  --locked
+```
+
+For a local checkout:
+
+```bash
+cargo +nightly-2026-03-26 install --path . --locked
+```
 
 Generate the default Rust test backend for a crate directory:
 
