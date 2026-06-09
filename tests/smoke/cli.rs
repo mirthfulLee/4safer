@@ -117,6 +117,16 @@ fn cargo_4safer_fuzz_backend_treats_fallible_outputs_as_discarded_inputs() {
             .all(|target| !target.contains("fallible API returned")),
         "expected fuzz targets not to classify ordinary Err/None as crashes"
     );
+    assert!(
+        fuzz_targets.iter().any(|target| {
+            target.contains("fn main()")
+                && target.contains("afl::fuzz_nohook!(|data: &[u8]|")
+                && target.contains("::std::panic::set_hook")
+                && target.contains("::std::panic::catch_unwind")
+                && target.contains("::std::panic::AssertUnwindSafe")
+        }),
+        "expected fuzz targets to keep target panics from aborting AFL seed validation"
+    );
 }
 
 #[test]

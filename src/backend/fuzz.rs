@@ -196,7 +196,8 @@ fn render_fuzz_target_file<'tcx>(
     lines.extend(function_lines);
     lines.push(String::new());
     lines.push("fn main() {".to_owned());
-    lines.push("    afl::fuzz!(|data: &[u8]| {".to_owned());
+    lines.push("    ::std::panic::set_hook(::std::boxed::Box::new(|_| {}));".to_owned());
+    lines.push("    afl::fuzz_nohook!(|data: &[u8]| {".to_owned());
 
     let mut offset = 0usize;
     for param_len in &param_lens {
@@ -227,9 +228,13 @@ fn render_fuzz_target_file<'tcx>(
         .map(|param| param.name.clone())
         .collect::<Vec<_>>()
         .join(", ");
+    lines.push(
+        "        let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {".to_owned(),
+    );
     lines.push(format!(
-        "        let _ = test_function{index}({call_args});"
+        "            let _ = test_function{index}({call_args});"
     ));
+    lines.push("        }));".to_owned());
     lines.push("    });".to_owned());
     lines.push("}".to_owned());
     let corpus = fuzz_seed_corpus_for_value_tys(tcx, params.iter().map(|param| param.value_ty))

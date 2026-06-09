@@ -10,6 +10,7 @@ FUZZ_JOBS="${FUZZ_JOBS:-2}"
 FUZZ_TIME_LIMIT="${FUZZ_TIME_LIMIT:-86400}"
 FUZZ_TARGET_TIMEOUT="${FUZZ_TARGET_TIMEOUT:-87000}"
 FUZZ_CRATE_JOBS="${FUZZ_CRATE_JOBS:-1}"
+FUZZ_SANITIZER="${FUZZ_SANITIZER:-address}"
 KANI_JOBS="${KANI_JOBS:-1}"
 KANI_TIMEOUT="${KANI_TIMEOUT:-0}"
 VARIES_KANI_DIR="${VARIES_KANI_DIR:-/data/huanli/projects/varies_root/varies_kani}"
@@ -111,11 +112,12 @@ python3 scripts/paper_backend_execution.py \
   --test-jobs "$TEST_JOBS" \
   --max-tests-per-crate "$MIRI_MAX_TESTS_PER_CRATE"
 
-# fuzz backend：使用 AFL 按所有 fuzz target 执行，单 target 最多 24h，检测到崩溃后可早停。
+# fuzz backend：默认使用 AFL + ASan 按所有 fuzz target 执行，单 target 最多 24h，检测到崩溃后可早停。
 run_experiment_container python3 scripts/paper_backend_execution.py \
   --experiment obligation-budget \
   --config od_budget_m4_d0 \
   --backend fuzz \
+  --fuzz-sanitizer "$FUZZ_SANITIZER" \
   --fuzz-targets all \
   --jobs "$FUZZ_CRATE_JOBS" \
   --fuzz-jobs "$FUZZ_JOBS" \
