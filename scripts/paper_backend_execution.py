@@ -13,6 +13,7 @@ import json
 import os
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -81,6 +82,12 @@ def main():
     parser.add_argument("--fuzz-target-timeout", type=int, default=24 * 60 * 60 + 600, help="Outer timeout in seconds for each fuzz target command.")
     parser.add_argument("--fuzz-stop-on-crash", action="store_true", default=True, help="Stop scheduling new fuzz targets for a crate after the first crashing/failing target.")
     parser.add_argument("--no-fuzz-stop-on-crash", dest="fuzz_stop_on_crash", action="store_false")
+    parser.add_argument(
+        "--fuzz-sanitizer",
+        choices=("none", "address", "memory", "thread"),
+        default="address",
+        help="Sanitizer used for AFL fuzz targets. Defaults to address (ASan); use none for native AFL.",
+    )
     parser.add_argument(
         "--kani-mode",
         choices=("config", "codegen", "proof"),
@@ -228,6 +235,11 @@ def run_backend(generation, args):
     if args.backend == "fuzz":
         env["AFL_EXIT_WHEN_DONE"] = "1"
         env["AFL_NO_AFFINITY"] = "1"
+        sanitizer = selected_fuzz_sanitizer(args)
+        if sanitizer:
+            env["RUSTFLAGS"] = append_space_flag(env.get("RUSTFLAGS"), f"-Zsanitizer={sanitizer}")
+            apply_sanitizer_env(env, sanitizer)
+            apply_afl_sanitizer_env(env, sanitizer)
     if args.backend == "kani":
         apply_varies_kani_env(args, env)
     target_dir = run_dir / "target"
@@ -237,7 +249,7 @@ def run_backend(generation, args):
         if args.dry_run:
             for target in fuzz_targets(harness, args.fuzz_targets):
                 input_dir = prepared_fuzz_input_dir(run_dir, target)
-                print(" ".join(afl_build_command(manifest, target)))
+                print(" ".join(afl_build_command(manifest, target, args)))
                 print(
                     " ".join(
                         fuzz_target_command(
@@ -405,6 +417,12 @@ def result_backend(args):
         return "tests-asan" if sanitizer == "address" else f"tests-{sanitizer}"
     if args.backend == "tests" and args.tests_runner == "miri":
         return "tests-miri"
+    if args.backend == "fuzz":
+        sanitizer = selected_fuzz_sanitizer(args)
+        if sanitizer == "address":
+            return "fuzz-asan"
+        if sanitizer:
+            return f"fuzz-{sanitizer}"
     return args.backend
 
 
@@ -517,21 +535,28 @@ def prepared_fuzz_input_dir(run_dir, target):
     return run_dir / "targets" / target / "afl-in"
 
 
-def afl_build_command(manifest, target):
+def afl_build_command(manifest, target, args):
+    sanitizer = selected_fuzz_sanitizer(args)
     return [
         "cargo",
         "afl",
         "build",
+        *(
+            ["-Zbuild-std"]
+            if sanitizer and sanitizer_needs_build_std(sanitizer)
+            else []
+        ),
         "--manifest-path",
         str(manifest),
         "--locked",
+        *(["--target", args.sanitizer_target_triple] if sanitizer else []),
         "--bin",
         target,
     ]
 
 
 def fuzz_target_command(target, args, input_dir, output_dir, target_dir):
-    binary = target_dir / "debug" / target
+    binary = fuzz_binary_path(target_dir, target, args)
     return [
         "cargo",
         "afl",
@@ -545,6 +570,13 @@ def fuzz_target_command(target, args, input_dir, output_dir, target_dir):
         "--",
         str(binary),
     ]
+
+
+def fuzz_binary_path(target_dir, target, args):
+    sanitizer = selected_fuzz_sanitizer(args)
+    if sanitizer:
+        return target_dir / args.sanitizer_target_triple / "debug" / target
+    return target_dir / "debug" / target
 
 
 def prepare_afl_input_dir(input_dir, valid_seed_results):
@@ -697,8 +729,9 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
         run_targets.append(
             {
                 "name": target,
-                "build_command": afl_build_command(manifest, target),
+                "build_command": afl_build_command(manifest, target, args),
                 "command": command,
+                "binary": str(fuzz_binary_path(run_dir / "target", target, args)),
                 "afl_input_dir": str(input_dir),
                 "afl_output_dir": str(output_dir),
                 "stdout_log": str(run_dir / "targets" / target / "stdout.log"),
@@ -712,8 +745,7 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                "export AFL_EXIT_WHEN_DONE=1",
-                "export AFL_NO_AFFINITY=1",
+                *fuzz_command_env_exports(env),
                 *(
                     command
                     for target in run_targets
@@ -748,6 +780,27 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
         "fuzz_jobs": args.fuzz_jobs,
         "fuzz_stop_on_crash": args.fuzz_stop_on_crash,
         "fuzz_targets_mode": args.fuzz_targets,
+        "fuzz_sanitizer": selected_fuzz_sanitizer(args),
+        "fuzz_sanitizer_build_std": bool(
+            selected_fuzz_sanitizer(args)
+            and sanitizer_needs_build_std(selected_fuzz_sanitizer(args))
+        ),
+        "sanitizer_target_triple": args.sanitizer_target_triple
+        if selected_fuzz_sanitizer(args)
+        else None,
+        "rustflags": env.get("RUSTFLAGS"),
+        "asan_options": env.get("ASAN_OPTIONS")
+        if selected_fuzz_sanitizer(args) == "address"
+        else None,
+        "msan_options": env.get("MSAN_OPTIONS")
+        if selected_fuzz_sanitizer(args) == "memory"
+        else None,
+        "tsan_options": env.get("TSAN_OPTIONS")
+        if selected_fuzz_sanitizer(args) == "thread"
+        else None,
+        "afl_use_asan": env.get("AFL_USE_ASAN"),
+        "afl_use_msan": env.get("AFL_USE_MSAN"),
+        "afl_use_tsan": env.get("AFL_USE_TSAN"),
         "afl_exit_when_done": "1",
         "afl_no_affinity": "1",
         "fuzz_targets_available": len(run_targets),
@@ -825,7 +878,7 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
     afl_output_dir = Path(target["afl_output_dir"])
     target_dir = run_dir / "targets" / target_name
     target_dir.mkdir(parents=True, exist_ok=True)
-    binary = run_dir / "target" / "debug" / target_name
+    binary = Path(target["binary"])
     stdout_path = target_dir / "stdout.log"
     stderr_path = target_dir / "stderr.log"
     started = time.monotonic()
@@ -914,6 +967,7 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
         "elapsed_sec": round(time.monotonic() - started, 3),
         "build_command": build_command,
         "command": command,
+        "binary": str(binary),
         "afl_input_dir": str(input_dir),
         "afl_output_dir": str(afl_output_dir),
         "stdout_log": str(stdout_path),
@@ -941,6 +995,7 @@ def skipped_fuzz_result(name):
         "elapsed_sec": 0.0,
         "build_command": [],
         "command": [],
+        "binary": "",
         "afl_output_dir": "",
         "stdout_log": "",
         "stderr_log": "",
@@ -954,9 +1009,10 @@ def skipped_fuzz_result(name):
 
 
 def has_fuzz_crash(text, exit_code):
+    lowered = text.lower()
     if "Test unit written to" in text or "crashes saved as" in text or "Saved as" in text:
         return True
-    if "ERROR: AddressSanitizer" in text or "runtime error:" in text:
+    if "addresssanitizer" in lowered or "runtime error:" in lowered:
         return True
     return exit_code not in (0, None, -999)
 
@@ -1560,6 +1616,13 @@ def selected_sanitizer(args):
     return args.sanitizer
 
 
+def selected_fuzz_sanitizer(args):
+    sanitizer = getattr(args, "fuzz_sanitizer", "address")
+    if sanitizer == "none":
+        return None
+    return sanitizer
+
+
 def sanitizer_needs_build_std(sanitizer):
     return sanitizer in {"thread", "memory"}
 
@@ -1571,6 +1634,14 @@ def apply_sanitizer_env(env, sanitizer):
             {
                 "abort_on_error": "1",
                 "detect_leaks": "0",
+                "symbolize": "0",
+            },
+        )
+    elif sanitizer == "memory":
+        env["MSAN_OPTIONS"] = merge_colon_options(
+            env.get("MSAN_OPTIONS"),
+            {
+                "halt_on_error": "1",
             },
         )
     elif sanitizer == "thread":
@@ -1580,6 +1651,35 @@ def apply_sanitizer_env(env, sanitizer):
                 "halt_on_error": "1",
             },
         )
+
+
+def apply_afl_sanitizer_env(env, sanitizer):
+    if sanitizer == "address":
+        env["AFL_USE_ASAN"] = "1"
+    elif sanitizer == "memory":
+        env["AFL_USE_MSAN"] = "1"
+    elif sanitizer == "thread":
+        env["AFL_USE_TSAN"] = "1"
+
+
+def fuzz_command_env_exports(env):
+    names = [
+        "AFL_EXIT_WHEN_DONE",
+        "AFL_NO_AFFINITY",
+        "AFL_USE_ASAN",
+        "AFL_USE_MSAN",
+        "AFL_USE_TSAN",
+        "CARGO_TARGET_DIR",
+        "RUSTFLAGS",
+        "ASAN_OPTIONS",
+        "MSAN_OPTIONS",
+        "TSAN_OPTIONS",
+    ]
+    return [
+        f"export {name}={shlex.quote(env[name])}"
+        for name in names
+        if env.get(name)
+    ]
 
 
 def append_space_flag(existing, flag):
@@ -1648,13 +1748,15 @@ def classify_unsoundness(stdout_text, stderr_text, status, exit_code):
     lowered = text.lower()
     if status == "timeout":
         return "timeout"
-    if "memorysanitizer" in text or "use-of-uninitialized-value" in lowered:
+    if "unsafe precondition(s) violated" in lowered:
+        return "unsafe_precondition"
+    if "memorysanitizer" in lowered or "use-of-uninitialized-value" in lowered:
         return "memory_sanitizer"
-    if "addresssanitizer" in text:
+    if "addresssanitizer" in lowered:
         return "address_sanitizer"
-    if "threadsanitizer" in text or "data race" in lowered:
+    if "threadsanitizer" in lowered or "data race" in lowered:
         return "thread_sanitizer"
-    if "undefined behavior" in lowered or "miri has detected undefined behavior" in lowered:
+    if "miri has detected undefined behavior" in lowered:
         return "miri_undefined_behavior"
     if "is uninitialized" in lowered or "using uninitialized data" in lowered:
         return "uninitialized"
@@ -1840,6 +1942,9 @@ def gather_unsoundness_cases(rows):
     cases = []
     for row in rows:
         backend = row.get("backend") or ""
+        if backend.startswith("fuzz"):
+            cases.extend(gather_fuzz_unsoundness_cases(row))
+            continue
         if not backend.startswith("tests-"):
             continue
         test_result_path = row.get("test_result_path")
@@ -1885,6 +1990,85 @@ def gather_unsoundness_cases(rows):
             )
     cases.sort(key=lambda row: (row["crate_key"], row["backend"], row["test"] or ""))
     return cases
+
+
+HIGH_CONFIDENCE_FUZZ_UNSOUNDNESS = {
+    "address_sanitizer",
+    "memory_sanitizer",
+    "thread_sanitizer",
+    "unsafe_precondition",
+}
+
+
+def gather_fuzz_unsoundness_cases(row):
+    path_text = row.get("fuzz_target_results_path")
+    if not path_text:
+        return []
+    path = Path(path_text)
+    try:
+        target_results = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+    cases = []
+    for target in target_results:
+        cases.extend(fuzz_target_unsoundness_cases(row, path, target))
+    return cases
+
+
+def fuzz_target_unsoundness_cases(row, path, target):
+    cases = []
+    target_name = target.get("name")
+    for source, status, exit_code, stdout_tail, stderr_tail in fuzz_target_observations(target):
+        kind = classify_unsoundness(stdout_tail, stderr_tail, status, int(exit_code or 0))
+        if kind not in HIGH_CONFIDENCE_FUZZ_UNSOUNDNESS:
+            continue
+        cases.append(
+            {
+                "crate": row.get("crate"),
+                "version": row.get("version"),
+                "crate_key": f"{row.get('crate')}-{row.get('version')}",
+                "backend": row.get("backend"),
+                "test": f"{target_name}:{source}",
+                "status": status,
+                "exit_code": exit_code,
+                "elapsed_sec": target.get("elapsed_sec"),
+                "classification": kind,
+                "first_error": target.get("first_error")
+                or first_error_text(stderr_tail)
+                or first_error_text(stdout_tail),
+                "stderr_tail": stderr_tail[:1000],
+                "stdout_tail": stdout_tail[:1000],
+                "stdout_log": target.get("stdout_log"),
+                "stderr_log": target.get("stderr_log"),
+                "result_json": str(path.parent / "result.json"),
+                "test_results_json": str(path),
+            }
+        )
+    return cases
+
+
+def fuzz_target_observations(target):
+    observations = [
+        (
+            "fuzz",
+            target.get("status"),
+            target.get("exit_code"),
+            target.get("stdout_tail") or "",
+            target.get("stderr_tail") or "",
+        )
+    ]
+    for seed in target.get("seed_validation_results") or []:
+        observations.append(
+            (
+                f"seed:{seed.get('name')}",
+                seed.get("status"),
+                seed.get("exit_code"),
+                seed.get("stdout_tail") or "",
+                seed.get("stderr_tail") or "",
+            )
+        )
+    return observations
 
 
 def write_unsoundness_markdown(path, cases):
