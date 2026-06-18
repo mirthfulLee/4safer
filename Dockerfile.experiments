@@ -6,11 +6,11 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG RUST_TOOLCHAIN=nightly-2026-03-26
 ARG KANI_TOOLCHAIN=nightly-2025-10-23
 
-ENV RUSTUP_HOME=/data/huanli_home/.rustup
-ENV CARGO_HOME=/data/huanli_home/.cargo
+ENV RUSTUP_HOME=/workspace_home/.rustup
+ENV CARGO_HOME=/workspace_home/.cargo
 ENV CARGO_KANI_TOOLCHAIN=${KANI_TOOLCHAIN}-x86_64-unknown-linux-gnu
-ENV VARIES_KANI_DIR=/opt/varies_kani
-ENV PATH=/opt/varies_kani/scripts:/opt/varies_kani/target/kani/bin:/data/huanli_home/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV FOURSAFER_KANI_DIR=/opt/varies_kani
+ENV PATH=/opt/varies_kani/scripts:/opt/varies_kani/target/kani/bin:/workspace_home/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update && \
     apt-get install --no-install-recommends --yes \
@@ -48,6 +48,6 @@ RUN printf '%s\n' \
       > /usr/local/bin/cargo-4safer-container-entrypoint && \
     chmod +x /usr/local/bin/cargo-4safer-container-entrypoint
 
-WORKDIR /data/huanli/projects/4safer
+WORKDIR /workspace/4safer
 ENTRYPOINT ["/usr/local/bin/cargo-4safer-container-entrypoint"]
 CMD ["bash"]

@@ -120,13 +120,6 @@ pub struct SequencePlan {
     pub queue_priority: f32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Identifies which generation candidate produced a synthesized sequence.
-pub enum SequenceCandidateKind {
-    BasicMaterialization,
-    MutatorExpansion,
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 /// Identifies the mutator operation inserted by an expansion candidate.
 pub struct MutatorIdentity {
@@ -135,23 +128,20 @@ pub struct MutatorIdentity {
 }
 
 #[derive(Clone, Copy, Debug)]
-/// Records the priority components used for queue ordering and budget charging.
+/// Records the priority components used for queue ordering.
 pub struct CandidateEvaluation {
     pub construction_cost: f32,
     pub prefix_distance: f32,
     pub target_to_wrapper_distance: f32,
     pub total_distance: f32,
     pub reuse_penalty: f32,
-    pub budget_charge: f32,
     pub queue_priority: f32,
 }
 
 #[derive(Clone, Debug)]
 /// Wraps one synthesized sequence together with the candidate metadata that
-/// produced it. This is the bridge toward a queue-based generator without
-/// forcing the planner to adopt wrapper-level budgeting yet.
+/// produced it.
 pub struct SequenceCandidate {
-    pub kind: SequenceCandidateKind,
     pub sequence: SequencePlan,
     pub construction_cost: f32,
     pub prefix_distance: f32,
@@ -183,12 +173,13 @@ pub struct TargetSynthesisSummary {
     pub base_sequences_before_cap: usize,
     pub base_sequences_after_cap: usize,
     pub base_materialization_failure: Option<&'static str>,
-    pub target_budget: f32,
-    pub target_budget_consumed: f32,
-    pub basic_budget: f32,
-    pub basic_budget_consumed: f32,
-    pub rejected_candidates_target_budget: usize,
-    pub rejected_candidates_basic_budget: usize,
+    pub wrapper_sequence_cap: usize,
+    pub wrapper_sequences_accepted: usize,
+    pub target_sequence_cap: usize,
+    pub target_sequences_accepted: usize,
+    pub basic_sequence_cap: usize,
+    pub rejected_candidates_wrapper_sequence_cap: usize,
+    pub rejected_candidates_target_sequence_cap: usize,
     pub mutator_rounds: Vec<MutatorRoundSummary>,
     pub stop_reason: &'static str,
 }
@@ -207,6 +198,10 @@ pub struct SynthesizedSuite<'tcx> {
 pub struct SynthesisConfig {
     pub max_depth: usize,
     pub max_mutators_per_target: usize,
+    pub max_sequences: usize,
+    pub max_sequences_per_wrapper: usize,
+    pub max_sequences_per_target: usize,
+    pub max_basic_sequences_per_target: usize,
     pub reuse_penalty_enabled: bool,
     pub depth_penalty_enabled: bool,
 }
@@ -247,15 +242,15 @@ impl<'tcx> ApiDescriptor<'tcx> {
 pub(crate) use api::{
     classify_api_safety, is_supported_callable, render_api_path, render_concrete_args,
 };
-pub use strategy::BudgetMode;
+pub use strategy::SequenceLimitMode;
 
-/// Dispatch obligation-driven sequence synthesis with the selected budget mode.
+/// Dispatch obligation-driven sequence synthesis with the selected limit mode.
 pub fn synthesize_suite<'tcx>(
-    budget_mode: BudgetMode,
+    sequence_limit_mode: SequenceLimitMode,
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     graph: &crate::rapx_graph::ApiDependencyGraph<'tcx>,
     field_facts_index: &crate::unsafe_analysis::ApiFieldFactsIndex,
     config: &SynthesisConfig,
 ) -> SynthesizedSuite<'tcx> {
-    strategy::synthesize_suite(budget_mode, tcx, graph, field_facts_index, config)
+    strategy::synthesize_suite(sequence_limit_mode, tcx, graph, field_facts_index, config)
 }

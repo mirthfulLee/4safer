@@ -111,26 +111,61 @@ pub struct FourSaferArgs {
         display_order = 15
     )]
     pub max_mutators_per_target: usize,
-    /// Disable obligation-driven budget limits for ablation runs.
+    /// Maximum number of synthesized sequences in the generated suite; 0 means unlimited.
     #[arg(
-        long = "disable-budget-limit",
-        visible_alias = "unbudgeted",
+        long = "max-sequences",
+        value_name = "COUNT",
+        default_value_t = 0,
         help_heading = "Core Options",
         display_order = 16
     )]
-    pub disable_budget_limit: bool,
+    pub max_sequences: usize,
+    /// Maximum synthesized sequences per unsafe wrapper group; 0 means unlimited.
+    #[arg(
+        long = "max-sequences-per-wrapper",
+        value_name = "COUNT",
+        default_value_t = 1024,
+        help_heading = "Core Options",
+        display_order = 17
+    )]
+    pub max_sequences_per_wrapper: usize,
+    /// Maximum synthesized sequences per obligation target; 0 means unlimited.
+    #[arg(
+        long = "max-sequences-per-target",
+        value_name = "COUNT",
+        default_value_t = 128,
+        help_heading = "Core Options",
+        display_order = 18
+    )]
+    pub max_sequences_per_target: usize,
+    /// Maximum basic, non-mutator-expanded sequences per target; 0 means unlimited.
+    #[arg(
+        long = "max-basic-sequences-per-target",
+        value_name = "COUNT",
+        default_value_t = 32,
+        help_heading = "Core Options",
+        display_order = 19
+    )]
+    pub max_basic_sequences_per_target: usize,
+    /// Disable wrapper/target sequence limits for ablation runs.
+    #[arg(
+        long = "disable-sequence-limits",
+        help_heading = "Core Options",
+        display_order = 20
+    )]
+    pub disable_sequence_limits: bool,
     /// Disable mutator reuse penalty when ordering obligation-driven actions.
     #[arg(
         long = "disable-reuse-penalty",
         help_heading = "Core Options",
-        display_order = 17
+        display_order = 21
     )]
     pub disable_reuse_penalty: bool,
-    /// Disable depth saturation and stagnation penalties for ablation runs.
+    /// Disable depth saturation penalties for ablation runs.
     #[arg(
         long = "disable-depth-penalty",
         help_heading = "Core Options",
-        display_order = 18
+        display_order = 22
     )]
     pub disable_depth_penalty: bool,
     /// Application log verbosity for 4safer stages.
@@ -139,7 +174,7 @@ pub struct FourSaferArgs {
         value_enum,
         default_value_t = LogLevel::Info,
         help_heading = "Core Options",
-        display_order = 19
+        display_order = 23
     )]
     pub log_level: LogLevel,
     /// Crate dir. Defaults to the current directory.
@@ -277,8 +312,16 @@ impl FourSaferArgs {
         args.push(self.max_depth.to_string());
         args.push("--max-mutators".to_owned());
         args.push(self.max_mutators_per_target.to_string());
-        if self.disable_budget_limit {
-            args.push("--disable-budget-limit".to_owned());
+        args.push("--max-sequences".to_owned());
+        args.push(self.max_sequences.to_string());
+        args.push("--max-sequences-per-wrapper".to_owned());
+        args.push(self.max_sequences_per_wrapper.to_string());
+        args.push("--max-sequences-per-target".to_owned());
+        args.push(self.max_sequences_per_target.to_string());
+        args.push("--max-basic-sequences-per-target".to_owned());
+        args.push(self.max_basic_sequences_per_target.to_string());
+        if self.disable_sequence_limits {
+            args.push("--disable-sequence-limits".to_owned());
         }
         if self.disable_reuse_penalty {
             args.push("--disable-reuse-penalty".to_owned());
@@ -316,20 +359,24 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_tests_backend_and_budgeted_obligation_planning() {
+    fn defaults_to_tests_backend_and_sequence_limited_obligation_planning() {
         let cli = FourSaferArgs::parse_flag_args(["4safer"]).expect("defaults should parse");
 
         assert_eq!(cli.harness_crate, PathBuf::from("foursafer_test"));
         assert_eq!(cli.backends, vec![BackendKind::Tests]);
         assert_eq!(cli.max_depth, 0);
         assert_eq!(cli.max_mutators_per_target, 4);
-        assert!(!cli.disable_budget_limit);
+        assert_eq!(cli.max_sequences, 0);
+        assert_eq!(cli.max_sequences_per_wrapper, 1024);
+        assert_eq!(cli.max_sequences_per_target, 128);
+        assert_eq!(cli.max_basic_sequences_per_target, 32);
+        assert!(!cli.disable_sequence_limits);
         assert!(!cli.check_harness);
         assert_eq!(cli.log_level, LogLevel::Info);
     }
 
     #[test]
-    fn parse_flag_args_accepts_common_options_and_budget_ablation() {
+    fn parse_flag_args_accepts_common_options_and_limit_ablation() {
         let cli = FourSaferArgs::parse_flag_args([
             "4safer",
             "-C",
@@ -341,9 +388,17 @@ mod tests {
             "7",
             "-M",
             "3",
+            "--max-sequences",
+            "32768",
+            "--max-sequences-per-wrapper",
+            "1024",
+            "--max-sequences-per-target",
+            "128",
+            "--max-basic-sequences-per-target",
+            "16",
             "-t",
             "30",
-            "--disable-budget-limit",
+            "--disable-sequence-limits",
             "--disable-reuse-penalty",
             "--disable-depth-penalty",
         ])
@@ -354,8 +409,12 @@ mod tests {
         assert!(cli.check_harness);
         assert_eq!(cli.max_depth, 7);
         assert_eq!(cli.max_mutators_per_target, 3);
+        assert_eq!(cli.max_sequences, 32768);
+        assert_eq!(cli.max_sequences_per_wrapper, 1024);
+        assert_eq!(cli.max_sequences_per_target, 128);
+        assert_eq!(cli.max_basic_sequences_per_target, 16);
         assert_eq!(cli.timeout, Some(30));
-        assert!(cli.disable_budget_limit);
+        assert!(cli.disable_sequence_limits);
         assert!(cli.disable_reuse_penalty);
         assert!(cli.disable_depth_penalty);
     }
@@ -375,7 +434,11 @@ mod tests {
             check_harness: true,
             max_depth: 7,
             max_mutators_per_target: 3,
-            disable_budget_limit: true,
+            max_sequences: 32768,
+            max_sequences_per_wrapper: 1024,
+            max_sequences_per_target: 128,
+            max_basic_sequences_per_target: 16,
+            disable_sequence_limits: true,
             disable_reuse_penalty: true,
             disable_depth_penalty: true,
             log_level: LogLevel::Debug,
@@ -403,7 +466,11 @@ mod tests {
             check_harness: false,
             max_depth: 4,
             max_mutators_per_target: 2,
-            disable_budget_limit: false,
+            max_sequences: 0,
+            max_sequences_per_wrapper: 1024,
+            max_sequences_per_target: 128,
+            max_basic_sequences_per_target: 32,
+            disable_sequence_limits: false,
             disable_reuse_penalty: false,
             disable_depth_penalty: false,
             log_level: LogLevel::Info,
@@ -447,7 +514,11 @@ mod tests {
             check_harness: false,
             max_depth: 4,
             max_mutators_per_target: 2,
-            disable_budget_limit: false,
+            max_sequences: 0,
+            max_sequences_per_wrapper: 1024,
+            max_sequences_per_target: 128,
+            max_basic_sequences_per_target: 32,
+            disable_sequence_limits: false,
             disable_reuse_penalty: false,
             disable_depth_penalty: false,
             log_level: LogLevel::Info,

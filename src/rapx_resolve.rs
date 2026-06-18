@@ -241,7 +241,7 @@ fn resolve_reachable_api_monos<'tcx>(
     let (mut non_generic_apis, generic_apis) = partition_generic_apis(graph.all_apis(), tcx);
     let mut generic_map: HashMap<DefId, Vec<Mono<'tcx>>> = HashMap::new();
 
-    let max_iterations = env_usize("VARIES_MAX_RESOLVE_ITERATIONS", MAX_RESOLVE_ITERATIONS);
+    let max_iterations = env_usize("FOURSAFER_MAX_RESOLVE_ITERATIONS", MAX_RESOLVE_ITERATIONS);
     for iteration in 0..max_iterations {
         let reachable_tys = type_candidates.candidates();
         let mut new_tys = HashSet::new();

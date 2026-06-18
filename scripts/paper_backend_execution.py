@@ -28,12 +28,13 @@ REPO = Path(__file__).resolve().parents[1]
 DEFAULT_GENERATION = REPO / "tmp/paper-experiments/runs/all_results.csv"
 DEFAULT_OUT = REPO / "tmp/paper-experiments/backend-execution"
 DEFAULT_KANI_CONFIG = REPO / "scripts/config/kani-ab-coverage.json"
-DEFAULT_VARIES_KANI_REPO = "git@github.com:mirthfulLee/varies_kani.git"
-DEFAULT_VARIES_KANI_DIR = Path(
-    os.environ.get("VARIES_KANI_DIR", "/data/huanli/projects/varies_root/varies_kani")
-)
-if not DEFAULT_VARIES_KANI_DIR.exists():
-    DEFAULT_VARIES_KANI_DIR = REPO / "tmp/paper-experiments/tools/varies_kani"
+DEFAULT_KANI_REPO = "git@github.com:mirthfulLee/varies_kani.git"
+if "FOURSAFER_KANI_DIR" in os.environ:
+    DEFAULT_FOURSAFER_KANI_DIR = Path(os.environ["FOURSAFER_KANI_DIR"])
+else:
+    DEFAULT_FOURSAFER_KANI_DIR = REPO.parent / "varies_root/varies_kani"
+if not DEFAULT_FOURSAFER_KANI_DIR.exists():
+    DEFAULT_FOURSAFER_KANI_DIR = REPO / "tmp/paper-experiments/tools/varies_kani"
 BACKENDS = ("tests", "fuzz", "kani")
 AFL_LEGACY_SAFE_SEED_GUARD = '        if data == b"\\0" {\n            return;\n        }\n'
 AFL_FUZZ_ENTRY = "    afl::fuzz!(|data: &[u8]| {\n"
@@ -44,8 +45,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generation-results", type=Path, default=DEFAULT_GENERATION)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    parser.add_argument("--experiment", default="obligation-budget")
-    parser.add_argument("--config", default="od_budget_m4_d0")
+    parser.add_argument("--experiment", default="obligation-sequence")
+    parser.add_argument("--config", default="od_sequence_m4_d0")
     parser.add_argument("--backend", choices=BACKENDS)
     parser.add_argument("--crate", action="append", default=[], help="Crate name or crate-version key.")
     parser.add_argument("--timeout", type=int, default=1800)
@@ -105,17 +106,17 @@ def main():
         default=None,
         help="Kani wrapper command for codegen/proof mode, or override for the first verify_cmd token.",
     )
-    parser.add_argument("--varies-kani-repo", default=DEFAULT_VARIES_KANI_REPO)
-    parser.add_argument("--varies-kani-dir", type=Path, default=DEFAULT_VARIES_KANI_DIR)
-    parser.add_argument("--build-varies-kani", action="store_true")
-    parser.add_argument("--prepare-varies-kani", action="store_true", default=True)
-    parser.add_argument("--no-prepare-varies-kani", dest="prepare_varies_kani", action="store_false")
+    parser.add_argument("--kani-repo", default=DEFAULT_KANI_REPO)
+    parser.add_argument("--kani-dir", type=Path, default=DEFAULT_FOURSAFER_KANI_DIR)
+    parser.add_argument("--build-kani", action="store_true")
+    parser.add_argument("--prepare-kani", action="store_true", default=True)
+    parser.add_argument("--no-prepare-kani", dest="prepare_kani", action="store_false")
     parser.add_argument("--aggregate-existing", action="store_true")
     args = parser.parse_args()
 
     args.out = args.out.resolve()
     args.kani_config = args.kani_config.resolve()
-    args.varies_kani_dir = args.varies_kani_dir.resolve()
+    args.kani_dir = args.kani_dir.resolve()
 
     if args.aggregate_existing:
         rows = gather_existing_results(args.out)
@@ -124,8 +125,8 @@ def main():
 
     if args.backend is None:
         parser.error("--backend is required unless --aggregate-existing is used")
-    if args.backend == "kani" and args.prepare_varies_kani and not args.dry_run:
-        prepare_varies_kani(args)
+    if args.backend == "kani" and args.prepare_kani and not args.dry_run:
+        prepare_kani(args)
 
     generation_rows = load_generation_rows(args)
     if not generation_rows:
@@ -241,7 +242,7 @@ def run_backend(generation, args):
             apply_sanitizer_env(env, sanitizer)
             apply_afl_sanitizer_env(env, sanitizer)
     if args.backend == "kani":
-        apply_varies_kani_env(args, env)
+        apply_kani_env(args, env)
     target_dir = run_dir / "target"
     env["CARGO_TARGET_DIR"] = str(target_dir)
 
@@ -461,10 +462,10 @@ def read_kani_config(path):
     return config
 
 
-def prepare_varies_kani(args):
-    source = args.varies_kani_dir
+def prepare_kani(args):
+    source = args.kani_dir
     if not source.exists():
-        repo = configured_varies_kani_repo(args)
+        repo = configured_kani_repo(args)
         source.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             ["git", "clone", repo, str(source)],
@@ -474,30 +475,30 @@ def prepare_varies_kani(args):
     if not wrapper.exists():
         raise RuntimeError(f"missing varies_kani wrapper: {wrapper}")
     cargo_kani = source / "target" / "kani" / "bin" / "cargo-kani"
-    if args.build_varies_kani:
+    if args.build_kani:
         subprocess.run(["cargo", "build-dev", "--", "--release"], cwd=source, check=True)
     elif not cargo_kani.exists():
         raise RuntimeError(
             f"missing varies_kani cargo-kani binary: {cargo_kani}. "
-            "Run with --build-varies-kani or build varies_kani before the experiment."
+            "Run with --build-kani or build varies_kani before the experiment."
         )
 
 
-def configured_varies_kani_repo(args):
+def configured_kani_repo(args):
     if args.kani_config.exists():
         config = read_kani_config(args.kani_config)
         varies_kani = config.get("varies_kani") or {}
         repo = varies_kani.get("repo")
         if repo:
             return repo
-    return args.varies_kani_repo
+    return args.kani_repo
 
 
-def apply_varies_kani_env(args, env):
-    if not args.prepare_varies_kani:
+def apply_kani_env(args, env):
+    if not args.prepare_kani:
         return
-    bin_dir = args.varies_kani_dir / "target" / "kani" / "bin"
-    scripts_dir = args.varies_kani_dir / "scripts"
+    bin_dir = args.kani_dir / "target" / "kani" / "bin"
+    scripts_dir = args.kani_dir / "scripts"
     env["PATH"] = prepend_path(env.get("PATH", ""), [scripts_dir, bin_dir])
 
 

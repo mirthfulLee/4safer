@@ -8,9 +8,9 @@ use selection::*;
 use super::super::api::build_api_descriptors;
 use super::super::{
     ApiDescriptor, ApiSafety, ArgPlan, BorrowMode, CallStep, CandidateEvaluation, MutatorIdentity,
-    MutatorRoundSummary, OutputAdapter, SequenceCandidate, SequenceCandidateKind, SequencePlan,
-    SynthesizedSuite, TargetSynthesisSummary, ValueSource, classify_api_safety,
-    is_supported_callable, render_api_path, render_concrete_args,
+    MutatorRoundSummary, OutputAdapter, SequenceCandidate, SequencePlan, SynthesizedSuite,
+    TargetSynthesisSummary, ValueSource, classify_api_safety, is_supported_callable,
+    render_api_path, render_concrete_args,
 };
 use crate::rapx_graph::{ApiDependencyGraph, TyWrapper};
 use crate::rapx_mono;
@@ -28,11 +28,7 @@ use std::time::Instant;
 const DEFAULT_TOP_K_CANDIDATES: usize = 8;
 const DEFAULT_MONO_TARGETS_PER_GENERIC_FUNCTION: usize = 4;
 const DEFAULT_TARGETS_PER_SHAPE: usize = 3;
-const DEFAULT_BASIC_SEQUENCES_PER_TARGET: usize = 32;
-const DEFAULT_EXPANDED_SEQUENCES_PER_TARGET: usize = 32;
 const DEFAULT_MULTI_OBLIGATED_PARAM_SEQUENCES_PER_TARGET: usize = 8;
-const DEFAULT_WRAPPER_BUDGET_BASE: f32 = 160.0;
-const DEFAULT_WRAPPER_BUDGET_SCALE: f32 = 64.0;
 const MAX_BASIC_CONSTRUCTOR_SEQUENCES: usize = 16;
 const MAX_MATERIALIZED_VARIANTS_PER_OBLIGATED_PARAM: usize = 8;
 const MAX_TARGET_PLAN_CANDIDATES: usize = 32;
@@ -45,15 +41,13 @@ const PREFIX_DISTANCE_WEIGHT: f32 = 1.0;
 const TARGET_DISTANCE_WEIGHT: f32 = 1.0;
 const REUSE_PENALTY_WEIGHT: f32 = 1.0;
 const DEPTH_SATURATION_WEIGHT: f32 = 0.25;
-const STAGNATION_BUDGET_THRESHOLD: f32 = 0.5;
+const STAGNATION_SEQUENCE_THRESHOLD: f32 = 0.5;
 const STAGNATION_DEPTH_WEIGHT: f32 = 0.5;
 
 #[derive(Clone, Copy, Debug)]
 struct PlannerCaps {
     mono_targets_per_generic_function: usize,
     targets_per_shape: usize,
-    basic_sequences_per_target: usize,
-    expanded_sequences_per_target: usize,
     multi_obligated_param_sequences_per_target: usize,
 }
 
@@ -62,8 +56,6 @@ impl Default for PlannerCaps {
         Self {
             mono_targets_per_generic_function: DEFAULT_MONO_TARGETS_PER_GENERIC_FUNCTION,
             targets_per_shape: DEFAULT_TARGETS_PER_SHAPE,
-            basic_sequences_per_target: DEFAULT_BASIC_SEQUENCES_PER_TARGET,
-            expanded_sequences_per_target: DEFAULT_EXPANDED_SEQUENCES_PER_TARGET,
             multi_obligated_param_sequences_per_target:
                 DEFAULT_MULTI_OBLIGATED_PARAM_SEQUENCES_PER_TARGET,
         }
@@ -83,15 +75,13 @@ struct PlannerTuning {
     mutation_round1_limit: usize,
     mutation_round2_limit: usize,
     mutation_round3_limit: usize,
-    wrapper_budget_base: f32,
-    wrapper_budget_scale: f32,
     construction_cost_weight: f32,
     prefix_distance_weight: f32,
     target_distance_weight: f32,
     reuse_penalty_weight: f32,
     depth_penalty_weight: f32,
     depth_saturation_weight: f32,
-    stagnation_budget_threshold: f32,
+    stagnation_sequence_threshold: f32,
     stagnation_depth_weight: f32,
 }
 
@@ -110,15 +100,13 @@ impl Default for PlannerTuning {
             mutation_round1_limit: 32,
             mutation_round2_limit: 16,
             mutation_round3_limit: 4,
-            wrapper_budget_base: DEFAULT_WRAPPER_BUDGET_BASE,
-            wrapper_budget_scale: DEFAULT_WRAPPER_BUDGET_SCALE,
             construction_cost_weight: CONSTRUCTION_COST_WEIGHT,
             prefix_distance_weight: PREFIX_DISTANCE_WEIGHT,
             target_distance_weight: TARGET_DISTANCE_WEIGHT,
             reuse_penalty_weight: REUSE_PENALTY_WEIGHT,
             depth_penalty_weight: 0.25,
             depth_saturation_weight: DEPTH_SATURATION_WEIGHT,
-            stagnation_budget_threshold: STAGNATION_BUDGET_THRESHOLD,
+            stagnation_sequence_threshold: STAGNATION_SEQUENCE_THRESHOLD,
             stagnation_depth_weight: STAGNATION_DEPTH_WEIGHT,
         }
     }
@@ -129,20 +117,15 @@ impl PlannerCaps {
         let defaults = Self::default();
         Self {
             mono_targets_per_generic_function: env_usize(
-                "VARIES_OD_MONO_TARGETS_PER_GENERIC_FUNCTION",
+                "FOURSAFER_OD_MONO_TARGETS_PER_GENERIC_FUNCTION",
                 defaults.mono_targets_per_generic_function,
             ),
-            targets_per_shape: env_usize("VARIES_OD_TARGETS_PER_SHAPE", defaults.targets_per_shape),
-            basic_sequences_per_target: env_usize(
-                "VARIES_OD_BASIC_SEQUENCES_PER_TARGET",
-                defaults.basic_sequences_per_target,
-            ),
-            expanded_sequences_per_target: env_usize(
-                "VARIES_OD_EXPANDED_SEQUENCES_PER_TARGET",
-                defaults.expanded_sequences_per_target,
+            targets_per_shape: env_usize(
+                "FOURSAFER_OD_TARGETS_PER_SHAPE",
+                defaults.targets_per_shape,
             ),
             multi_obligated_param_sequences_per_target: env_usize(
-                "VARIES_OD_MULTI_OBLIGATED_PARAM_SEQUENCES_PER_TARGET",
+                "FOURSAFER_OD_MULTI_OBLIGATED_PARAM_SEQUENCES_PER_TARGET",
                 defaults.multi_obligated_param_sequences_per_target,
             ),
         }
@@ -153,85 +136,77 @@ impl PlannerTuning {
     fn from_env() -> Self {
         let defaults = Self::default();
         Self {
-            top_k_candidates: env_usize("VARIES_OD_TOP_K_CANDIDATES", defaults.top_k_candidates),
+            top_k_candidates: env_usize("FOURSAFER_OD_TOP_K_CANDIDATES", defaults.top_k_candidates),
             max_basic_constructor_sequences: env_usize(
-                "VARIES_OD_MAX_BASIC_CONSTRUCTOR_SEQUENCES",
+                "FOURSAFER_OD_MAX_BASIC_CONSTRUCTOR_SEQUENCES",
                 defaults.max_basic_constructor_sequences,
             ),
             max_materialized_variants_per_obligated_param: env_usize(
-                "VARIES_OD_MAX_MATERIALIZED_VARIANTS_PER_OBLIGATED_PARAM",
+                "FOURSAFER_OD_MAX_MATERIALIZED_VARIANTS_PER_OBLIGATED_PARAM",
                 defaults.max_materialized_variants_per_obligated_param,
             ),
             max_target_plan_candidates: env_usize(
-                "VARIES_OD_MAX_TARGET_PLAN_CANDIDATES",
+                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES",
                 defaults.max_target_plan_candidates,
             ),
             max_call_plan_candidates: env_usize(
-                "VARIES_OD_MAX_CALL_PLAN_CANDIDATES",
+                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES",
                 defaults.max_call_plan_candidates,
             ),
             max_combined_prefixes: env_usize(
-                "VARIES_OD_MAX_COMBINED_PREFIXES",
+                "FOURSAFER_OD_MAX_COMBINED_PREFIXES",
                 defaults.max_combined_prefixes,
             ),
             max_mutator_candidates_per_param: env_usize(
-                "VARIES_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM",
+                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM",
                 defaults.max_mutator_candidates_per_param,
             ),
             mutation_round0_limit: env_usize(
-                "VARIES_OD_MUTATION_ROUND0_LIMIT",
+                "FOURSAFER_OD_MUTATION_ROUND0_LIMIT",
                 defaults.mutation_round0_limit,
             ),
             mutation_round1_limit: env_usize(
-                "VARIES_OD_MUTATION_ROUND1_LIMIT",
+                "FOURSAFER_OD_MUTATION_ROUND1_LIMIT",
                 defaults.mutation_round1_limit,
             ),
             mutation_round2_limit: env_usize(
-                "VARIES_OD_MUTATION_ROUND2_LIMIT",
+                "FOURSAFER_OD_MUTATION_ROUND2_LIMIT",
                 defaults.mutation_round2_limit,
             ),
             mutation_round3_limit: env_usize(
-                "VARIES_OD_MUTATION_ROUND3_LIMIT",
+                "FOURSAFER_OD_MUTATION_ROUND3_LIMIT",
                 defaults.mutation_round3_limit,
             ),
-            wrapper_budget_base: env_f32(
-                "VARIES_OD_WRAPPER_BUDGET_BASE",
-                defaults.wrapper_budget_base,
-            ),
-            wrapper_budget_scale: env_f32(
-                "VARIES_OD_WRAPPER_BUDGET_SCALE",
-                defaults.wrapper_budget_scale,
-            ),
             construction_cost_weight: env_f32(
-                "VARIES_OD_CONSTRUCTION_COST_WEIGHT",
+                "FOURSAFER_OD_CONSTRUCTION_COST_WEIGHT",
                 defaults.construction_cost_weight,
             ),
             prefix_distance_weight: env_f32(
-                "VARIES_OD_PREFIX_DISTANCE_WEIGHT",
+                "FOURSAFER_OD_PREFIX_DISTANCE_WEIGHT",
                 defaults.prefix_distance_weight,
             ),
             target_distance_weight: env_f32(
-                "VARIES_OD_TARGET_DISTANCE_WEIGHT",
+                "FOURSAFER_OD_TARGET_DISTANCE_WEIGHT",
                 defaults.target_distance_weight,
             ),
             reuse_penalty_weight: env_f32(
-                "VARIES_OD_REUSE_PENALTY_WEIGHT",
+                "FOURSAFER_OD_REUSE_PENALTY_WEIGHT",
                 defaults.reuse_penalty_weight,
             ),
             depth_penalty_weight: env_f32(
-                "VARIES_OD_DEPTH_PENALTY_WEIGHT",
+                "FOURSAFER_OD_DEPTH_PENALTY_WEIGHT",
                 defaults.depth_penalty_weight,
             ),
             depth_saturation_weight: env_f32(
-                "VARIES_OD_DEPTH_SATURATION_WEIGHT",
+                "FOURSAFER_OD_DEPTH_SATURATION_WEIGHT",
                 defaults.depth_saturation_weight,
             ),
-            stagnation_budget_threshold: env_f32(
-                "VARIES_OD_STAGNATION_BUDGET_THRESHOLD",
-                defaults.stagnation_budget_threshold,
+            stagnation_sequence_threshold: env_f32(
+                "FOURSAFER_OD_STAGNATION_SEQUENCE_THRESHOLD",
+                defaults.stagnation_sequence_threshold,
             ),
             stagnation_depth_weight: env_f32(
-                "VARIES_OD_STAGNATION_DEPTH_WEIGHT",
+                "FOURSAFER_OD_STAGNATION_DEPTH_WEIGHT",
                 defaults.stagnation_depth_weight,
             ),
         }
@@ -270,11 +245,15 @@ pub(crate) struct Planner<'tcx, 'a> {
     target_materialization_rank_cache: HashMap<usize, TargetMaterializationRank>,
     max_depth: usize,
     max_mutators_per_target: usize,
+    max_sequences: usize,
+    max_sequences_per_wrapper: usize,
+    max_sequences_per_target: usize,
+    max_basic_sequences_per_target: usize,
     reuse_penalty_enabled: bool,
     depth_penalty_enabled: bool,
     caps: PlannerCaps,
     tuning: PlannerTuning,
-    relax_unbudgeted_filters: bool,
+    relax_sequence_limit_filters: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -295,7 +274,7 @@ struct CallPlan {
     args: Vec<Option<ArgPlan>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PartialCallPlan {
     prefix: Vec<CallStep>,
     args: Vec<Option<ArgPlan>>,
@@ -338,6 +317,10 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         field_facts_index: &'a ApiFieldFactsIndex,
         max_depth: usize,
         max_mutators_per_target: usize,
+        max_sequences: usize,
+        max_sequences_per_wrapper: usize,
+        max_sequences_per_target: usize,
+        max_basic_sequences_per_target: usize,
         reuse_penalty_enabled: bool,
         depth_penalty_enabled: bool,
     ) -> Self {
@@ -390,11 +373,15 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             target_materialization_rank_cache: HashMap::new(),
             max_depth,
             max_mutators_per_target,
+            max_sequences,
+            max_sequences_per_wrapper,
+            max_sequences_per_target,
+            max_basic_sequences_per_target,
             reuse_penalty_enabled,
             depth_penalty_enabled,
             caps: PlannerCaps::from_env(),
             tuning: PlannerTuning::from_env(),
-            relax_unbudgeted_filters: false,
+            relax_sequence_limit_filters: false,
         }
     }
 
@@ -410,6 +397,13 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         let mut sequences = Vec::new();
         let mut target_summaries = Vec::new();
         for (unsafe_wrapper, target_group) in target_groups {
+            if self.sequence_limit_reached(sequences.len()) {
+                info!(
+                    target: "foursafer::planner",
+                    "global suite sequence cap reached; skipping remaining target groups"
+                );
+                break;
+            }
             self.synthesize_target_group(
                 &unsafe_wrapper,
                 &target_group,
@@ -418,7 +412,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             );
         }
 
-        sort_sequence_plans_preserving_links(&mut sequences);
+        self.cap_and_sort_suite_sequences(&mut sequences);
 
         SynthesizedSuite {
             apis: self.apis,
@@ -427,19 +421,26 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         }
     }
 
-    pub(crate) fn synthesize_unbudgeted(mut self) -> SynthesizedSuite<'tcx> {
-        self.relax_unbudgeted_filters = true;
+    pub(crate) fn synthesize_unlimited(mut self) -> SynthesizedSuite<'tcx> {
+        self.relax_sequence_limit_filters = true;
         let target_groups = self.select_target_function_groups(self.collect_obligation_targets());
         info!(
             target: "foursafer::planner",
-            "obligation-driven unbudgeted planner: {} unsafe wrappers after relaxed target selection",
+            "obligation-driven unlimited planner: {} unsafe wrappers after relaxed target selection",
             target_groups.len()
         );
 
         let mut sequences = Vec::new();
         let mut target_summaries = Vec::new();
         for (unsafe_wrapper, target_group) in target_groups {
-            self.synthesize_target_group_unbudgeted(
+            if self.sequence_limit_reached(sequences.len()) {
+                info!(
+                    target: "foursafer::planner",
+                    "global suite sequence cap reached; skipping remaining target groups"
+                );
+                break;
+            }
+            self.synthesize_target_group_unlimited(
                 &unsafe_wrapper,
                 &target_group,
                 &mut sequences,
@@ -447,12 +448,44 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             );
         }
 
-        sort_sequence_plans_preserving_links(&mut sequences);
+        self.cap_and_sort_suite_sequences(&mut sequences);
 
         SynthesizedSuite {
             apis: self.apis,
             sequences,
             target_summaries,
         }
+    }
+
+    fn cap_and_sort_suite_sequences(&self, sequences: &mut Vec<SequencePlan>) {
+        if self.max_sequences == 0 {
+            sort_sequence_plans_preserving_links(sequences);
+            return;
+        }
+
+        let uncapped_len = sequences.len();
+        cap_sequence_plans_preserving_predecessors(sequences, self.max_sequences);
+        if sequences.len() < uncapped_len {
+            info!(
+                target: "foursafer::planner",
+                "global suite sequence cap retained {} of {} sequences (limit={})",
+                sequences.len(),
+                uncapped_len,
+                self.max_sequences
+            );
+        }
+        sort_sequence_plans_preserving_links(sequences);
+    }
+
+    pub(super) fn sequence_limit_reached(&self, sequence_count: usize) -> bool {
+        self.max_sequences != 0 && sequence_count >= self.max_sequences
+    }
+
+    pub(super) fn remaining_sequence_capacity(&self, sequence_count: usize) -> Option<usize> {
+        (self.max_sequences != 0).then(|| self.max_sequences.saturating_sub(sequence_count))
+    }
+
+    pub(super) fn sequence_generation_limit(&self) -> Option<usize> {
+        (self.max_sequences != 0).then_some(self.max_sequences)
     }
 }

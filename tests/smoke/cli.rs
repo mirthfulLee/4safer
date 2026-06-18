@@ -19,7 +19,11 @@ fn cargo_4safer_help_lists_common_flags() {
     assert!(stdout.contains("tests"));
     assert!(stdout.contains("kani"));
     assert!(stdout.contains("fuzz"));
-    assert!(stdout.contains("--disable-budget-limit"));
+    assert!(stdout.contains("--max-sequences <COUNT>"));
+    assert!(stdout.contains("--max-sequences-per-wrapper <COUNT>"));
+    assert!(stdout.contains("--max-sequences-per-target <COUNT>"));
+    assert!(stdout.contains("--max-basic-sequences-per-target <COUNT>"));
+    assert!(stdout.contains("--disable-sequence-limits"));
     assert!(stdout.contains("--disable-reuse-penalty"));
     assert!(stdout.contains("--disable-depth-penalty"));
     assert!(!stdout.contains("--strategy"));
@@ -65,19 +69,37 @@ fn cargo_4safer_defaults_to_tests_backend_and_writes_metadata() {
 }
 
 #[test]
-fn cargo_4safer_accepts_budget_ablation_flag() {
+fn cargo_4safer_limits_default_planner_by_wrapper_sequence_count() {
     let run = run_4safer_on_fixture(
         "unsafe-wrapper-indirect-field-lib",
-        "unbudgeted-harness",
+        "sequence-capped-harness",
         true,
-        &["--disable-budget-limit"],
+        &["--max-sequences-per-wrapper", "1"],
+    );
+    run.assert_success();
+
+    let sequence_metadata = run.sequence_metadata("unsafe_wrapper_indirect_field_lib");
+    assert_eq!(
+        sequence_metadata.len(),
+        1,
+        "expected wrapper sequence cap to retain exactly one sequence"
+    );
+}
+
+#[test]
+fn cargo_4safer_accepts_limit_ablation_flag() {
+    let run = run_4safer_on_fixture(
+        "unsafe-wrapper-indirect-field-lib",
+        "unlimited-harness",
+        true,
+        &["--disable-sequence-limits"],
     );
     run.assert_success();
 
     let sequence_metadata = run.sequence_metadata("unsafe_wrapper_indirect_field_lib");
     assert!(
         !sequence_metadata.is_empty(),
-        "expected unbudgeted obligation-driven synthesis to emit sequences"
+        "expected unlimited obligation-driven synthesis to emit sequences"
     );
 }
 

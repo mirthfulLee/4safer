@@ -48,7 +48,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         for (_, api_indices) in &mut groups {
             api_indices.sort_unstable();
             api_indices.dedup();
-            if !self.relax_unbudgeted_filters {
+            if !self.relax_sequence_limit_filters {
                 *api_indices = self.select_representative_targets(api_indices);
             }
         }
@@ -409,17 +409,6 @@ fn mono_target_tiebreak<'a, 'tcx>(api: &'a ApiDescriptor<'tcx>) -> (usize, &'a s
     (
         api.concrete_args.iter().map(|arg| arg.len()).sum(),
         api.instantiated_path.as_str(),
-    )
-}
-
-pub(super) fn mono_target_budget_priority<'tcx>(
-    api: &ApiDescriptor<'tcx>,
-) -> (usize, usize, usize, String) {
-    (
-        usize::from(api.api_safety != ApiSafety::UnsafeBlock),
-        usize::from(api.field_facts.obligation_inputs.is_empty()),
-        mono_target_type_complexity(api),
-        api.instantiated_path.clone(),
     )
 }
 

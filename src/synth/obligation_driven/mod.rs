@@ -21,13 +21,17 @@ pub(super) fn synthesize_suite<'tcx>(
         field_facts_index,
         config.max_depth,
         config.max_mutators_per_target,
+        config.max_sequences,
+        config.max_sequences_per_wrapper,
+        config.max_sequences_per_target,
+        config.max_basic_sequences_per_target,
         config.reuse_penalty_enabled,
         config.depth_penalty_enabled,
     )
     .synthesize()
 }
 
-pub(super) fn synthesize_suite_unbudgeted<'tcx>(
+pub(super) fn synthesize_suite_unlimited<'tcx>(
     tcx: TyCtxt<'tcx>,
     graph: &ApiDependencyGraph<'tcx>,
     field_facts_index: &ApiFieldFactsIndex,
@@ -39,8 +43,12 @@ pub(super) fn synthesize_suite_unbudgeted<'tcx>(
         field_facts_index,
         config.max_depth,
         config.max_mutators_per_target,
+        config.max_sequences,
+        config.max_sequences_per_wrapper,
+        config.max_sequences_per_target,
+        config.max_basic_sequences_per_target,
         config.reuse_penalty_enabled,
         config.depth_penalty_enabled,
     )
-    .synthesize_unbudgeted()
+    .synthesize_unlimited()
 }

@@ -20,8 +20,7 @@ and generated metadata is written next to the harness crate for validation.
 - The default generated crate is `foursafer_test`.
 - The default backend is `tests`; `kani` and `fuzz` can still be selected with
   `--backend`.
-- Budget-limit ablation is controlled by `--disable-budget-limit` or its
-  visible alias `--unbudgeted`.
+- Sequence-limit ablation is controlled by `--disable-sequence-limits`.
 - Metadata is written under `foursafer_meta`.
 
 Contract extraction for unsafe calls and pointer operations remains a
@@ -81,10 +80,10 @@ Build-check the generated harness after synthesis:
 cargo 4safer -C /path/to/crate --check-harness
 ```
 
-Run the unbudgeted planner for budget ablation:
+Run without wrapper/target sequence caps for ablation:
 
 ```bash
-cargo 4safer -C /path/to/crate --disable-budget-limit
+cargo 4safer -C /path/to/crate --disable-sequence-limits
 ```
 
 Render a non-default backend:
@@ -119,7 +118,15 @@ Common options:
 - `-c, --check-harness`: run a quick generated-crate validation step.
 - `-d, --max-depth <CALLS>`: max call count per sequence; `0` means unlimited.
 - `-M, --max-mutators <N>`: maximum extra mutator rounds per target sequence.
-- `--disable-budget-limit`: remove obligation-driven planner budget caps for
+- `--max-sequences <COUNT>`: max generated sequences in the whole suite; `0`
+  means unlimited.
+- `--max-sequences-per-wrapper <COUNT>`: max generated sequences per unsafe
+  wrapper group.
+- `--max-sequences-per-target <COUNT>`: max generated sequences per obligation
+  target.
+- `--max-basic-sequences-per-target <COUNT>`: max non-mutator-expanded
+  sequences per target.
+- `--disable-sequence-limits`: remove wrapper/target/basic sequence caps for
   ablation.
 - `--disable-reuse-penalty`: disable mutator reuse penalty for ablation.
 - `--disable-depth-penalty`: disable depth saturation and stagnation penalties

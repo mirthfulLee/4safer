@@ -2,8 +2,8 @@ use crate::backend::{BackendRenderContext, write_suite};
 use crate::cli::FourSaferArgs;
 use crate::rapx_graph::{ApiDependencyGraph, Config};
 use crate::synth::{
-    BudgetMode, SynthesisConfig, classify_api_safety, is_supported_callable, render_api_path,
-    synthesize_suite,
+    SequenceLimitMode, SynthesisConfig, classify_api_safety, is_supported_callable,
+    render_api_path, synthesize_suite,
 };
 use crate::unsafe_analysis::{ApiFieldFactsIndex, analyze_public_unsafe_surfaces};
 use crate::workspace::discover_target_for_analysis;
@@ -55,15 +55,20 @@ pub fn run_pipeline<'tcx>(tcx: TyCtxt<'tcx>, cli: &FourSaferArgs) -> Result<Anal
     debug!(target: "foursafer::pipeline", "graph contains {} api instances after generic resolution", graph.num_api());
     info!(target: "foursafer::pipeline", "planning verification sequences");
     let synth_start = Instant::now();
-    let budget_mode = BudgetMode::from_disable_limit(cli.disable_budget_limit);
+    let sequence_limit_mode =
+        SequenceLimitMode::from_disable_sequence_limits(cli.disable_sequence_limits);
     let suite = synthesize_suite(
-        budget_mode,
+        sequence_limit_mode,
         tcx,
         &graph,
         &field_facts_index,
         &SynthesisConfig {
             max_depth: cli.max_depth,
             max_mutators_per_target: cli.max_mutators_per_target,
+            max_sequences: cli.max_sequences,
+            max_sequences_per_wrapper: cli.max_sequences_per_wrapper,
+            max_sequences_per_target: cli.max_sequences_per_target,
+            max_basic_sequences_per_target: cli.max_basic_sequences_per_target,
             reuse_penalty_enabled: !cli.disable_reuse_penalty,
             depth_penalty_enabled: !cli.disable_depth_penalty,
         },

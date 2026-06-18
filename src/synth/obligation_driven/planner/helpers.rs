@@ -622,7 +622,21 @@ pub(super) fn rank_sequence_candidates(
     candidates.sort_by(|left, right| compare_sequence_candidates(left, right, tuning));
 }
 
-pub(super) fn pop_next_unbudgeted_candidate(
+pub(super) fn rank_and_truncate_sequence_candidates(
+    mut candidates: Vec<SequenceCandidate>,
+    limit: usize,
+    tuning: &PlannerTuning,
+) -> Vec<SequenceCandidate> {
+    if candidates.len() <= limit {
+        return candidates;
+    }
+
+    rank_sequence_candidates(&mut candidates, tuning);
+    candidates.truncate(limit);
+    candidates
+}
+
+pub(super) fn pop_next_unlimited_candidate(
     candidates: &mut Vec<SequenceCandidate>,
     tuning: &PlannerTuning,
 ) -> Option<SequenceCandidate> {
@@ -685,10 +699,6 @@ pub(super) fn evaluate_candidate(
         target_to_wrapper_distance: candidate.target_to_wrapper_distance,
         total_distance,
         reuse_penalty,
-        budget_charge: tuning.construction_cost_weight * candidate.construction_cost
-            + total_distance
-            + tuning.reuse_penalty_weight * reuse_penalty
-            + depth_penalty,
         queue_priority: tuning.construction_cost_weight * candidate.construction_cost
             + total_distance
             + tuning.reuse_penalty_weight * reuse_penalty
