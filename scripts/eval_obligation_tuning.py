@@ -44,139 +44,63 @@ CONFIGS = {
     "sequence_limits": [
         {"name": "sequence_low", "max_mutators": 2, "max_depth": 0, "max_sequences_per_target": 16, "max_basic_sequences_per_target": 8},
         {"name": "sequence_high", "max_mutators": 2, "max_depth": 0, "max_sequences_per_target": 128, "max_basic_sequences_per_target": 32},
-        {"name": "candidates_low", "max_mutators": 2, "max_depth": 0, "env": {"FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "4", "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "4", "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "8"}},
-        {"name": "candidates_high", "max_mutators": 2, "max_depth": 0, "env": {"FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16", "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16", "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32"}},
         {"name": "reuse_weight_high", "max_mutators": 2, "max_depth": 0, "env": {"FOURSAFER_OD_REUSE_PENALTY_WEIGHT": "2.0"}},
         {"name": "distance_weight_high", "max_mutators": 2, "max_depth": 0, "env": {"FOURSAFER_OD_PREFIX_DISTANCE_WEIGHT": "1.5", "FOURSAFER_OD_TARGET_DISTANCE_WEIGHT": "1.5"}},
         {"name": "depth_pressure_high", "max_mutators": 2, "max_depth": 0, "env": {"FOURSAFER_OD_DEPTH_SATURATION_WEIGHT": "0.5", "FOURSAFER_OD_STAGNATION_DEPTH_WEIGHT": "1.0"}},
     ],
     "combo": [
         {
-            "name": "sequence_high_candidates_high",
-            "max_mutators": 2,
-            "max_depth": 0,
-            "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
-            },
-        },
-        {
             "name": "sequence_high_reuse_weight_high",
             "max_mutators": 2,
             "max_depth": 0,
+            "max_sequences_per_target": 128,
+            "max_basic_sequences_per_target": 32,
             "env": {
                 "FOURSAFER_OD_REUSE_PENALTY_WEIGHT": "2.0",
             },
         },
         {
-            "name": "sequence_high_candidates_high_reuse_weight_high",
-            "max_mutators": 2,
-            "max_depth": 0,
-            "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
-                "FOURSAFER_OD_REUSE_PENALTY_WEIGHT": "2.0",
-            },
-        },
-        {
-            "name": "sequence_high_candidates_high_m3",
+            "name": "sequence_high_m3",
             "max_mutators": 3,
             "max_depth": 0,
-            "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
-            },
+            "max_sequences_per_target": 128,
+            "max_basic_sequences_per_target": 32,
         },
         {
-            "name": "sequence_high_candidates_high_m4",
+            "name": "sequence_high_m4",
             "max_mutators": 4,
             "max_depth": 0,
-            "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
-            },
+            "max_sequences_per_target": 128,
+            "max_basic_sequences_per_target": 32,
         },
         {
-            "name": "sequence_high_candidates_high_m4_r3_8",
+            "name": "sequence_high_m4_depth_cost_05",
             "max_mutators": 4,
             "max_depth": 0,
+            "max_sequences_per_target": 128,
+            "max_basic_sequences_per_target": 32,
             "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
-                "FOURSAFER_OD_MUTATION_ROUND3_LIMIT": "8",
-            },
-        },
-        {
-            "name": "sequence_high_candidates_high_m4_r3_4",
-            "max_mutators": 4,
-            "max_depth": 0,
-            "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
-                "FOURSAFER_OD_MUTATION_ROUND3_LIMIT": "4",
-            },
-        },
-        {
-            "name": "sequence_high_candidates_high_m4_depth_cost_05",
-            "max_mutators": 4,
-            "max_depth": 0,
-            "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
                 "FOURSAFER_OD_DEPTH_PENALTY_WEIGHT": "0.5",
             },
         },
         {
-            "name": "sequence_high_candidates_high_m4_depth_cost_025",
+            "name": "sequence_high_m4_depth_cost_025",
             "max_mutators": 4,
             "max_depth": 0,
+            "max_sequences_per_target": 128,
+            "max_basic_sequences_per_target": 32,
             "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
                 "FOURSAFER_OD_DEPTH_PENALTY_WEIGHT": "0.25",
             },
         },
         {
-            "name": "sequence_high_candidates_high_m4_depth_cost_1",
+            "name": "sequence_high_m4_depth_cost_1",
             "max_mutators": 4,
             "max_depth": 0,
+            "max_sequences_per_target": 128,
+            "max_basic_sequences_per_target": 32,
             "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
                 "FOURSAFER_OD_DEPTH_PENALTY_WEIGHT": "1.0",
-            },
-        },
-        {
-            "name": "sequence_high_candidates_high_m4_r3_4_depth_cost_05",
-            "max_mutators": 4,
-            "max_depth": 0,
-            "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
-                "FOURSAFER_OD_MUTATION_ROUND3_LIMIT": "4",
-                "FOURSAFER_OD_DEPTH_PENALTY_WEIGHT": "0.5",
-            },
-        },
-        {
-            "name": "sequence_high_candidates_high_m4_r3_4_depth_cost_025",
-            "max_mutators": 4,
-            "max_depth": 0,
-            "env": {
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM": "16",
-                "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES": "16",
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES": "32",
-                "FOURSAFER_OD_MUTATION_ROUND3_LIMIT": "4",
-                "FOURSAFER_OD_DEPTH_PENALTY_WEIGHT": "0.25",
             },
         },
     ],
@@ -236,7 +160,6 @@ def run_one(crate_dir, config, timeout, force):
             "--max-basic-sequences-per-target",
             str(config["max_basic_sequences_per_target"]),
         ])
-
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
     env.update(config.get("env", {}))

@@ -28,11 +28,11 @@ use std::time::Instant;
 const DEFAULT_TOP_K_CANDIDATES: usize = 8;
 const DEFAULT_MONO_TARGETS_PER_GENERIC_FUNCTION: usize = 4;
 const DEFAULT_TARGETS_PER_SHAPE: usize = 3;
-const DEFAULT_MULTI_OBLIGATED_PARAM_SEQUENCES_PER_TARGET: usize = 8;
+const DEFAULT_MULTI_OBLIGATED_PARAM_SEQUENCES_PER_TARGET: usize = 16;
 const MAX_BASIC_CONSTRUCTOR_SEQUENCES: usize = 16;
 const MAX_MATERIALIZED_VARIANTS_PER_OBLIGATED_PARAM: usize = 8;
 const MAX_TARGET_PLAN_CANDIDATES: usize = 32;
-const MAX_CALL_PLAN_CANDIDATES: usize = 16;
+const MAX_CALL_PLAN_CANDIDATES: usize = 128;
 const MAX_COMBINED_PREFIXES: usize = 32;
 const MAX_MUTATOR_CANDIDATES_PER_PARAM: usize = 16;
 const ALLOW_REQUIRED_PROVIDED_OVERLAP: bool = true;
@@ -96,10 +96,10 @@ impl Default for PlannerTuning {
             max_call_plan_candidates: MAX_CALL_PLAN_CANDIDATES,
             max_combined_prefixes: MAX_COMBINED_PREFIXES,
             max_mutator_candidates_per_param: MAX_MUTATOR_CANDIDATES_PER_PARAM,
-            mutation_round0_limit: 64,
-            mutation_round1_limit: 32,
-            mutation_round2_limit: 16,
-            mutation_round3_limit: 4,
+            mutation_round0_limit: 16,
+            mutation_round1_limit: 8,
+            mutation_round2_limit: 4,
+            mutation_round3_limit: 2,
             construction_cost_weight: CONSTRUCTION_COST_WEIGHT,
             prefix_distance_weight: PREFIX_DISTANCE_WEIGHT,
             target_distance_weight: TARGET_DISTANCE_WEIGHT,
@@ -116,14 +116,8 @@ impl PlannerCaps {
     fn from_env() -> Self {
         let defaults = Self::default();
         Self {
-            mono_targets_per_generic_function: env_usize(
-                "FOURSAFER_OD_MONO_TARGETS_PER_GENERIC_FUNCTION",
-                defaults.mono_targets_per_generic_function,
-            ),
-            targets_per_shape: env_usize(
-                "FOURSAFER_OD_TARGETS_PER_SHAPE",
-                defaults.targets_per_shape,
-            ),
+            mono_targets_per_generic_function: defaults.mono_targets_per_generic_function,
+            targets_per_shape: defaults.targets_per_shape,
             multi_obligated_param_sequences_per_target: env_usize(
                 "FOURSAFER_OD_MULTI_OBLIGATED_PARAM_SEQUENCES_PER_TARGET",
                 defaults.multi_obligated_param_sequences_per_target,
@@ -136,47 +130,21 @@ impl PlannerTuning {
     fn from_env() -> Self {
         let defaults = Self::default();
         Self {
-            top_k_candidates: env_usize("FOURSAFER_OD_TOP_K_CANDIDATES", defaults.top_k_candidates),
-            max_basic_constructor_sequences: env_usize(
-                "FOURSAFER_OD_MAX_BASIC_CONSTRUCTOR_SEQUENCES",
-                defaults.max_basic_constructor_sequences,
-            ),
-            max_materialized_variants_per_obligated_param: env_usize(
-                "FOURSAFER_OD_MAX_MATERIALIZED_VARIANTS_PER_OBLIGATED_PARAM",
-                defaults.max_materialized_variants_per_obligated_param,
-            ),
-            max_target_plan_candidates: env_usize(
-                "FOURSAFER_OD_MAX_TARGET_PLAN_CANDIDATES",
-                defaults.max_target_plan_candidates,
-            ),
+            top_k_candidates: defaults.top_k_candidates,
+            max_basic_constructor_sequences: defaults.max_basic_constructor_sequences,
+            max_materialized_variants_per_obligated_param: defaults
+                .max_materialized_variants_per_obligated_param,
+            max_target_plan_candidates: defaults.max_target_plan_candidates,
             max_call_plan_candidates: env_usize(
                 "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES",
                 defaults.max_call_plan_candidates,
             ),
-            max_combined_prefixes: env_usize(
-                "FOURSAFER_OD_MAX_COMBINED_PREFIXES",
-                defaults.max_combined_prefixes,
-            ),
-            max_mutator_candidates_per_param: env_usize(
-                "FOURSAFER_OD_MAX_MUTATOR_CANDIDATES_PER_PARAM",
-                defaults.max_mutator_candidates_per_param,
-            ),
-            mutation_round0_limit: env_usize(
-                "FOURSAFER_OD_MUTATION_ROUND0_LIMIT",
-                defaults.mutation_round0_limit,
-            ),
-            mutation_round1_limit: env_usize(
-                "FOURSAFER_OD_MUTATION_ROUND1_LIMIT",
-                defaults.mutation_round1_limit,
-            ),
-            mutation_round2_limit: env_usize(
-                "FOURSAFER_OD_MUTATION_ROUND2_LIMIT",
-                defaults.mutation_round2_limit,
-            ),
-            mutation_round3_limit: env_usize(
-                "FOURSAFER_OD_MUTATION_ROUND3_LIMIT",
-                defaults.mutation_round3_limit,
-            ),
+            max_combined_prefixes: defaults.max_combined_prefixes,
+            max_mutator_candidates_per_param: defaults.max_mutator_candidates_per_param,
+            mutation_round0_limit: defaults.mutation_round0_limit,
+            mutation_round1_limit: defaults.mutation_round1_limit,
+            mutation_round2_limit: defaults.mutation_round2_limit,
+            mutation_round3_limit: defaults.mutation_round3_limit,
             construction_cost_weight: env_f32(
                 "FOURSAFER_OD_CONSTRUCTION_COST_WEIGHT",
                 defaults.construction_cost_weight,

@@ -11,7 +11,6 @@ use rustc_span::sym;
 use rustc_trait_selection::traits::Obligation;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
 use std::collections::{HashMap, HashSet};
-use std::env;
 
 const MAX_TY_COMPLEXITY: usize = 6;
 const MAX_RESOLVE_ITERATIONS: usize = 10;
@@ -241,8 +240,7 @@ fn resolve_reachable_api_monos<'tcx>(
     let (mut non_generic_apis, generic_apis) = partition_generic_apis(graph.all_apis(), tcx);
     let mut generic_map: HashMap<DefId, Vec<Mono<'tcx>>> = HashMap::new();
 
-    let max_iterations = env_usize("FOURSAFER_MAX_RESOLVE_ITERATIONS", MAX_RESOLVE_ITERATIONS);
-    for iteration in 0..max_iterations {
+    for iteration in 0..MAX_RESOLVE_ITERATIONS {
         let reachable_tys = type_candidates.candidates();
         let mut new_tys = HashSet::new();
         let mut trait_impl_candidates_cache: HashMap<DefId, Vec<ty::TraitRef<'tcx>>> =
@@ -334,15 +332,6 @@ fn resolve_reachable_api_monos<'tcx>(
     }
 
     generic_map
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    match env::var(name) {
-        Ok(value) => value
-            .parse::<usize>()
-            .unwrap_or_else(|error| panic!("{name} must be usize, got `{value}`: {error}")),
-        Err(_) => default,
-    }
 }
 
 fn is_symbolically_reconstructible_ty<'tcx>(ty: Ty<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
