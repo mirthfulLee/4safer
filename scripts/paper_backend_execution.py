@@ -38,7 +38,7 @@ if not DEFAULT_FOURSAFER_KANI_DIR.exists():
 BACKENDS = ("tests", "fuzz", "kani")
 AFL_LEGACY_SAFE_SEED_GUARD = '        if data == b"\\0" {\n            return;\n        }\n'
 AFL_FUZZ_ENTRY = "    afl::fuzz!(|data: &[u8]| {\n"
-FUZZ_SEED_VALIDATION_TIMEOUT = 5
+FUZZ_CRASH_REPLAY_TIMEOUT = 10
 
 
 def main():
@@ -79,10 +79,12 @@ def main():
     parser.add_argument("--env", action="append", default=[], help="Extra environment override, KEY=VALUE.")
     parser.add_argument("--fuzz-targets", choices=("first", "all"), default="first")
     parser.add_argument("--fuzz-jobs", type=int, default=1, help="Number of fuzz targets to execute in parallel per crate.")
-    parser.add_argument("--fuzz-time-limit", type=int, default=24 * 60 * 60, help="Per-fuzz-target AFL -V time limit in seconds.")
-    parser.add_argument("--fuzz-target-timeout", type=int, default=24 * 60 * 60 + 600, help="Outer timeout in seconds for each fuzz target command.")
-    parser.add_argument("--fuzz-stop-on-crash", action="store_true", default=True, help="Stop scheduling new fuzz targets for a crate after the first crashing/failing target.")
+    parser.add_argument("--fuzz-time-limit", type=int, default=0, help="Per-fuzz-target AFL -V time limit in seconds; 0 means use --timeout.")
+    parser.add_argument("--fuzz-target-timeout", type=int, default=0, help="Outer timeout in seconds for each fuzz target command; 0 means AFL -V time plus 600s.")
+    parser.add_argument("--fuzz-stop-on-crash", action="store_true", default=True, help="Stop the current fuzz target early after the first high-confidence UB finding.")
     parser.add_argument("--no-fuzz-stop-on-crash", dest="fuzz_stop_on_crash", action="store_false")
+    parser.add_argument("--reuse-fuzz-target-results", action="store_true", default=True, help="When rerunning with --force, reuse existing non-skipped fuzz target results and only execute missing/skipped targets.")
+    parser.add_argument("--no-reuse-fuzz-target-results", dest="reuse_fuzz_target_results", action="store_false")
     parser.add_argument(
         "--fuzz-sanitizer",
         choices=("none", "address", "memory", "thread"),
@@ -91,9 +93,13 @@ def main():
     )
     parser.add_argument(
         "--kani-mode",
-        choices=("config", "codegen", "proof"),
+        choices=("config", "codegen", "proof", "official-proof"),
         default="config",
-        help="Kani execution mode. config uses --kani-config verify_cmd; codegen/proof use --kani-command.",
+        help=(
+            "Kani execution mode. config uses --kani-config verify_cmd; "
+            "codegen/proof use --kani-command; official-proof runs each generated "
+            "kani::proof harness with cargo kani."
+        ),
     )
     parser.add_argument(
         "--kani-config",
@@ -111,6 +117,10 @@ def main():
     parser.add_argument("--build-kani", action="store_true")
     parser.add_argument("--prepare-kani", action="store_true", default=True)
     parser.add_argument("--no-prepare-kani", dest="prepare_kani", action="store_false")
+    parser.add_argument("--kani-jobs", type=int, default=1, help="Number of Kani proof harnesses to execute in parallel per crate.")
+    parser.add_argument("--kani-proof-timeout", type=int, default=1200, help="Per-Kani-proof timeout in seconds for --kani-mode official-proof.")
+    parser.add_argument("--kani-arg", action="append", default=[], help="Extra argument passed to each official cargo kani invocation.")
+    parser.add_argument("--kani-extra-args", default="", help="Shell-style extra arguments passed to each official cargo kani invocation.")
     parser.add_argument("--aggregate-existing", action="store_true")
     args = parser.parse_args()
 
@@ -125,7 +135,12 @@ def main():
 
     if args.backend is None:
         parser.error("--backend is required unless --aggregate-existing is used")
-    if args.backend == "kani" and args.prepare_kani and not args.dry_run:
+    if (
+        args.backend == "kani"
+        and args.kani_mode != "official-proof"
+        and args.prepare_kani
+        and not args.dry_run
+    ):
         prepare_kani(args)
 
     generation_rows = load_generation_rows(args)
@@ -212,7 +227,12 @@ def run_backend(generation, args):
     if result_path.exists() and not args.force:
         return json.loads(result_path.read_text())
 
-    if args.force and run_dir.exists():
+    if (
+        args.force
+        and run_dir.exists()
+        and not (args.backend == "kani" and args.kani_mode == "official-proof")
+        and not (args.backend == "fuzz" and args.reuse_fuzz_target_results)
+    ):
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -286,6 +306,12 @@ def run_backend(generation, args):
 
     if args.backend == "tests":
         result = run_tests_backend(generation, args, run_dir, harness, env, command)
+        if not args.keep_target:
+            shutil.rmtree(target_dir, ignore_errors=True)
+        return result
+
+    if args.backend == "kani" and args.kani_mode == "official-proof":
+        result = run_official_kani_backend(generation, args, run_dir, harness, env, command)
         if not args.keep_target:
             shutil.rmtree(target_dir, ignore_errors=True)
         return result
@@ -398,6 +424,15 @@ def backend_command(args, manifest):
             manifest.parent / "target",
         )
     if args.backend == "kani":
+        if args.kani_mode == "official-proof":
+            command = shlex.split(args.kani_command) if args.kani_command else ["cargo", "kani"]
+            if "--manifest-path" not in command and not any(
+                arg.startswith("--manifest-path=") for arg in command
+            ):
+                command.extend(["--manifest-path", str(manifest)])
+            command.extend(args.kani_arg)
+            command.extend(shlex.split(args.kani_extra_args))
+            return command
         if args.kani_mode == "config":
             command = configured_kani_command(args)
         else:
@@ -495,6 +530,8 @@ def configured_kani_repo(args):
 
 
 def apply_kani_env(args, env):
+    if args.kani_mode == "official-proof":
+        return
     if not args.prepare_kani:
         return
     bin_dir = args.kani_dir / "target" / "kani" / "bin"
@@ -556,8 +593,10 @@ def afl_build_command(manifest, target, args):
     ]
 
 
-def fuzz_target_command(target, args, input_dir, output_dir, target_dir):
+def fuzz_target_command(target, args, input_dir, output_dir, target_dir, time_limit=None):
     binary = fuzz_binary_path(target_dir, target, args)
+    if time_limit is None:
+        time_limit = fuzz_target_time_limit(args)
     return [
         "cargo",
         "afl",
@@ -567,7 +606,7 @@ def fuzz_target_command(target, args, input_dir, output_dir, target_dir):
         "-o",
         str(output_dir),
         "-V",
-        str(args.fuzz_time_limit),
+        str(max(1, int(time_limit))),
         "--",
         str(binary),
     ]
@@ -697,7 +736,7 @@ def validate_fuzz_seed_candidates(binary, harness, env, candidates):
             cwd=harness,
             env=env,
             stdin_bytes=data,
-            timeout=FUZZ_SEED_VALIDATION_TIMEOUT,
+            timeout=None,
         )
         status = "timeout" if timed_out else "ok" if exit_code == 0 else "crash"
         row = {
@@ -722,6 +761,11 @@ def direct_fuzz_binary_command(binary):
 def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
     started = time.monotonic()
     targets = fuzz_targets(harness, args.fuzz_targets)
+    existing_results = (
+        load_existing_fuzz_target_results(run_dir)
+        if args.reuse_fuzz_target_results
+        else {}
+    )
     run_targets = []
     for target in targets:
         input_dir = prepared_fuzz_input_dir(run_dir, target)
@@ -737,6 +781,7 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
                 "afl_output_dir": str(output_dir),
                 "stdout_log": str(run_dir / "targets" / target / "stdout.log"),
                 "stderr_log": str(run_dir / "targets" / target / "stderr.log"),
+                "existing_result": existing_results.get(target),
             }
         )
 
@@ -776,8 +821,9 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
         "exit_code": fuzz_group_exit_code(target_results),
         "elapsed_sec": round(time.monotonic() - started, 3),
         "timeout_sec": args.timeout,
-        "fuzz_target_timeout_sec": args.fuzz_target_timeout,
-        "fuzz_time_limit_sec": args.fuzz_time_limit,
+        "timeout_scope": "fuzz-target",
+        "fuzz_target_timeout_sec": fuzz_outer_timeout(args, fuzz_target_time_limit(args)),
+        "fuzz_time_limit_sec": fuzz_target_time_limit(args),
         "fuzz_jobs": args.fuzz_jobs,
         "fuzz_stop_on_crash": args.fuzz_stop_on_crash,
         "fuzz_targets_mode": args.fuzz_targets,
@@ -810,7 +856,9 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
         "fuzz_targets_fail": sum(1 for row in target_results if row["status"] == "fail"),
         "fuzz_targets_timeout": sum(1 for row in target_results if row["status"] == "timeout"),
         "fuzz_targets_skipped": sum(1 for row in target_results if row["status"] == "skipped"),
+        "fuzz_targets_reused": sum(1 for row in target_results if row.get("reused")),
         "fuzz_crashes": sum(1 for row in target_results if row.get("crash_detected")),
+        "fuzz_early_stop_targets": sum(1 for row in target_results if row.get("fuzz_early_stop")),
         "fuzz_execs_done": sum(int(row.get("fuzz_execs_done") or 0) for row in target_results),
         "fuzz_target_results_path": str(run_dir / "fuzz_target_results.json"),
         "fuzz_target_results": target_results,
@@ -827,50 +875,39 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
 
 def run_fuzz_targets_serial(run_targets, harness, env, args, run_dir):
     results = []
-    stop = False
     for target in run_targets:
-        if stop:
-            results.append(skipped_fuzz_result(target["name"]))
-            continue
         result = run_one_fuzz_target(target, harness, env, args, run_dir)
         results.append(result)
-        if args.fuzz_stop_on_crash and result["status"] in ("fail", "timeout"):
-            stop = True
     return results
 
 
 def run_fuzz_targets_parallel(run_targets, harness, env, args, run_dir):
-    stop_event = threading.Event()
     results = [None] * len(run_targets)
+    next_index = 0
+    index_lock = threading.Lock()
+
+    def worker():
+        nonlocal next_index
+        while True:
+            with index_lock:
+                if next_index >= len(run_targets):
+                    return
+                index = next_index
+                next_index += 1
+            results[index] = run_one_fuzz_target(run_targets[index], harness, env, args, run_dir)
+
     with ThreadPoolExecutor(max_workers=max(1, args.fuzz_jobs)) as executor:
-        futures = {
-            executor.submit(
-                run_one_fuzz_target_guarded,
-                run_targets[index],
-                harness,
-                env,
-                args,
-                run_dir,
-                stop_event,
-            ): index
-            for index in range(len(run_targets))
-        }
+        futures = [executor.submit(worker) for _ in range(min(max(1, args.fuzz_jobs), len(run_targets)))]
         for future in as_completed(futures):
-            index = futures[future]
-            result = future.result()
-            results[index] = result
-            if args.fuzz_stop_on_crash and result["status"] in ("fail", "timeout"):
-                stop_event.set()
+            future.result()
     return [result if result is not None else skipped_fuzz_result(run_targets[index]["name"]) for index, result in enumerate(results)]
 
 
-def run_one_fuzz_target_guarded(target, harness, env, args, run_dir, stop_event):
-    if stop_event.is_set():
-        return skipped_fuzz_result(target["name"])
-    return run_one_fuzz_target(target, harness, env, args, run_dir)
-
-
 def run_one_fuzz_target(target, harness, env, args, run_dir):
+    existing_result = target.get("existing_result")
+    if reusable_fuzz_target_result(existing_result):
+        return existing_result
+
     target_name = target["name"]
     build_command = target["build_command"]
     command = target["command"]
@@ -893,6 +930,7 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
     valid_seed_results = []
     seed_validation_failed = False
     seed_validation_error = None
+    fuzz_early_stop_info = None
     try:
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
             write_log(stdout, f"\n[paper-backend-execution] running {' '.join(build_command)}\n", None)
@@ -902,7 +940,7 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
                 env=env,
                 stdout=stdout,
                 stderr=stderr,
-                timeout=args.timeout,
+                timeout=None,
             )
             build_exit_code = completed.returncode
             if build_exit_code != 0:
@@ -933,15 +971,29 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
                     write_log(stdout, f"[paper-backend-execution] {seed_validation_error}\n", None)
                 else:
                     prepare_afl_input_dir(input_dir, valid_seed_results)
+                    fuzz_time_limit = fuzz_target_time_limit(args)
+                    if fuzz_time_limit is not None and fuzz_time_limit <= 0:
+                        raise subprocess.TimeoutExpired(command, fuzz_time_limit)
+                    command = fuzz_target_command(
+                        target_name,
+                        args,
+                        input_dir,
+                        afl_output_dir,
+                        run_dir / "target",
+                        fuzz_time_limit,
+                    )
                     write_log(stdout, f"\n[paper-backend-execution] running {' '.join(command)}\n", None)
                     fuzz_ran = True
-                    completed = run_command(
+                    completed, fuzz_early_stop_info = run_fuzz_command(
                         command,
                         cwd=harness,
                         env=env,
                         stdout=stdout,
                         stderr=stderr,
-                        timeout=args.fuzz_target_timeout,
+                        timeout=fuzz_outer_timeout(args, fuzz_time_limit),
+                        binary=binary,
+                        afl_output_dir=afl_output_dir,
+                        stop_on_ub=args.fuzz_stop_on_crash,
                     )
                     fuzz_exit_code = completed.returncode
                     exit_code = fuzz_exit_code
@@ -959,7 +1011,7 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
     if crash_detected and status == "ok":
         status = "fail"
         exit_code = 1
-    return {
+    result = {
         "name": target_name,
         "status": status,
         "exit_code": exit_code,
@@ -985,7 +1037,63 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
         "seed_valid": len(valid_seed_results),
         "seed_validation_failed": seed_validation_failed,
         "seed_validation_results": seed_validation_results,
+        "timeout_scope": "fuzz-target",
+        "fuzz_time_limit_sec": fuzz_target_time_limit(args),
+        "fuzz_target_timeout_sec": fuzz_outer_timeout(args, fuzz_target_time_limit(args)),
+        "fuzz_early_stop_info": fuzz_early_stop_info,
     }
+    result["unsoundness_kind"] = fuzz_target_primary_unsoundness_kind(result)
+    result["fuzz_early_stop"] = fuzz_result_is_high_confidence_unsoundness(result)
+    return result
+
+
+def load_existing_fuzz_target_results(run_dir):
+    path = run_dir / "fuzz_target_results.json"
+    try:
+        rows = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    results = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name")
+        if not name:
+            continue
+        normalized = normalize_existing_fuzz_target_result(row)
+        results[name] = normalized
+    return results
+
+
+def normalize_existing_fuzz_target_result(row):
+    normalized = dict(row)
+    if normalized.get("status") == "skipped":
+        normalized.setdefault("unsoundness_kind", None)
+        normalized.setdefault("fuzz_early_stop", False)
+        return normalized
+    normalized.setdefault("timeout_scope", "fuzz-target")
+    normalized["unsoundness_kind"] = fuzz_target_primary_unsoundness_kind(normalized)
+    normalized["fuzz_early_stop"] = fuzz_result_is_high_confidence_unsoundness(normalized)
+    normalized["reused"] = True
+    return normalized
+
+
+def reusable_fuzz_target_result(result):
+    return isinstance(result, dict) and result.get("status") != "skipped"
+
+
+def fuzz_target_time_limit(args):
+    if args.fuzz_time_limit and args.fuzz_time_limit > 0:
+        return args.fuzz_time_limit
+    return args.timeout
+
+
+def fuzz_outer_timeout(args, fuzz_time_limit):
+    if args.fuzz_target_timeout and args.fuzz_target_timeout > 0:
+        return args.fuzz_target_timeout
+    if fuzz_time_limit and fuzz_time_limit > 0:
+        return fuzz_time_limit + 600
+    return None
 
 
 def skipped_fuzz_result(name):
@@ -1006,7 +1114,18 @@ def skipped_fuzz_result(name):
         "fuzz_execs_done": 0,
         "fuzz_crash_count": 0,
         "crash_detected": False,
+        "unsoundness_kind": None,
+        "fuzz_early_stop": False,
     }
+
+
+HIGH_CONFIDENCE_FUZZ_UNSOUNDNESS = {
+    "address_sanitizer",
+    "memory_sanitizer",
+    "thread_sanitizer",
+    "undefined_behavior_sanitizer",
+    "unsafe_precondition",
+}
 
 
 def has_fuzz_crash(text, exit_code):
@@ -1018,13 +1137,121 @@ def has_fuzz_crash(text, exit_code):
     return exit_code not in (0, None, -999)
 
 
-def afl_crash_count(output_dir):
-    crash_dirs = [
+def run_fuzz_command(
+    command,
+    cwd,
+    env,
+    stdout,
+    stderr,
+    timeout,
+    binary,
+    afl_output_dir,
+    stop_on_ub,
+):
+    if timeout is not None and timeout <= 0:
+        timeout = None
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=stdout,
+        stderr=stderr,
+        start_new_session=True,
+    )
+    monitor_stop = threading.Event()
+    early_stop_info = {}
+    monitor = None
+    if stop_on_ub:
+        monitor = threading.Thread(
+            target=monitor_fuzz_crashes_for_ub,
+            args=(process, binary, cwd, env, afl_output_dir, monitor_stop, early_stop_info),
+            daemon=True,
+        )
+        monitor.start()
+    try:
+        exit_code = process.wait(timeout=timeout)
+        completed = subprocess.CompletedProcess(command, exit_code)
+    except subprocess.TimeoutExpired:
+        kill_process_group(process)
+        raise
+    finally:
+        monitor_stop.set()
+        if monitor is not None:
+            monitor.join(timeout=1)
+    return completed, early_stop_info or None
+
+
+def monitor_fuzz_crashes_for_ub(process, binary, cwd, env, afl_output_dir, stop_event, early_stop_info):
+    seen = set()
+    while not stop_event.is_set() and process.poll() is None:
+        for crash_path in afl_crash_files(afl_output_dir):
+            if crash_path in seen:
+                continue
+            seen.add(crash_path)
+            replay = replay_fuzz_crash(binary, cwd, env, crash_path)
+            kind = classify_unsoundness(
+                replay["stdout_tail"],
+                replay["stderr_tail"],
+                replay["status"],
+                replay["exit_code"],
+            )
+            if kind not in HIGH_CONFIDENCE_FUZZ_UNSOUNDNESS:
+                continue
+            early_stop_info.update(
+                {
+                    "reason": "high_confidence_ub",
+                    "classification": kind,
+                    "crash_input": str(crash_path),
+                    "replay_exit_code": replay["exit_code"],
+                    "replay_stdout_tail": replay["stdout_tail"],
+                    "replay_stderr_tail": replay["stderr_tail"],
+                }
+            )
+            kill_process_group(process)
+            return
+        stop_event.wait(1)
+
+
+def afl_crash_files(output_dir):
+    paths = []
+    for crash_dir in afl_crash_dirs(output_dir):
+        if not crash_dir.exists():
+            continue
+        paths.extend(
+            path
+            for path in crash_dir.iterdir()
+            if path.is_file() and path.name.startswith("id:")
+        )
+    return sorted(paths)
+
+
+def replay_fuzz_crash(binary, cwd, env, crash_path):
+    data = crash_path.read_bytes()
+    exit_code, stdout, stderr, timed_out = run_command_with_stdin_capture(
+        direct_fuzz_binary_command(binary),
+        cwd=cwd,
+        env=env,
+        stdin_bytes=data,
+        timeout=FUZZ_CRASH_REPLAY_TIMEOUT,
+    )
+    return {
+        "status": "timeout" if timed_out else "ok" if exit_code == 0 else "fail",
+        "exit_code": exit_code,
+        "stdout_tail": decode_tail(stdout),
+        "stderr_tail": decode_tail(stderr),
+    }
+
+
+def afl_crash_dirs(output_dir):
+    return [
         output_dir / "default" / "crashes",
         output_dir / "crashes",
     ]
+
+
+def afl_crash_count(output_dir):
     count = 0
-    for crash_dir in crash_dirs:
+    for crash_dir in afl_crash_dirs(output_dir):
         if not crash_dir.exists():
             continue
         count += sum(
@@ -1080,6 +1307,272 @@ def first_fuzz_error(target_results):
         if row["status"] in ("fail", "timeout"):
             return f"{row['name']}: {row['status']}"
     return None
+
+
+def fuzz_result_is_high_confidence_unsoundness(result):
+    return fuzz_target_high_confidence_unsoundness_kind(result) is not None
+
+
+def fuzz_target_primary_unsoundness_kind(target):
+    high_confidence = fuzz_target_high_confidence_unsoundness_kind(target)
+    if high_confidence is not None:
+        return high_confidence
+    for _source, status, exit_code, stdout_tail, stderr_tail in fuzz_target_observations(target):
+        kind = classify_unsoundness(stdout_tail, stderr_tail, status, int(exit_code or 0))
+        if kind:
+            return kind
+    return None
+
+
+def fuzz_target_high_confidence_unsoundness_kind(target):
+    for _source, status, exit_code, stdout_tail, stderr_tail in fuzz_target_observations(target):
+        kind = classify_unsoundness(stdout_tail, stderr_tail, status, int(exit_code or 0))
+        if kind in HIGH_CONFIDENCE_FUZZ_UNSOUNDNESS:
+            return kind
+    return None
+
+
+def run_official_kani_backend(generation, args, run_dir, harness, env, command):
+    stdout_path = run_dir / "stdout.log"
+    stderr_path = run_dir / "stderr.log"
+    proof_results_path = run_dir / "kani_proof_results.json"
+    proof_result_dir = run_dir / "proof_results"
+    proof_log_dir = run_dir / "proof_logs"
+    started = time.monotonic()
+    available_proofs = generated_kani_proof_names(harness)
+    # Official Kani runs have their own per-harness timeout (`--harness-timeout`).
+    # Do not apply a crate-level deadline here: large crates with many generated
+    # proofs should be able to run all harnesses, bounded individually.
+    suite_deadline = None
+    log_lock = threading.Lock()
+    proof_result_dir.mkdir(parents=True, exist_ok=True)
+    existing_results = load_existing_official_kani_results(
+        available_proofs, proof_result_dir, proof_log_dir, stdout_path, stderr_path
+    )
+    for proof_name, result in existing_results.items():
+        write_official_kani_proof_result(proof_result_dir, proof_name, result)
+    pending_proofs = [name for name in available_proofs if name not in existing_results]
+
+    with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+        if existing_results:
+            write_log(
+                stdout,
+                (
+                    "[paper-backend-execution] reusing "
+                    f"{len(existing_results)} existing Kani proof results\n"
+                ),
+                None,
+            )
+        proof_results_by_name = dict(existing_results)
+        proof_results_by_name.update(
+            run_official_kani_proofs(
+                pending_proofs,
+                args.kani_jobs,
+                lambda proof_name, timeout: run_one_official_kani_proof(
+                    command,
+                    proof_name,
+                    harness,
+                    env,
+                    stdout,
+                    stderr,
+                    timeout,
+                    proof_log_dir,
+                    log_lock,
+                ),
+                proof_result_dir,
+                suite_deadline,
+                args.kani_proof_timeout,
+                proof_log_dir,
+            )
+        )
+    proof_results = [proof_results_by_name[name] for name in available_proofs]
+
+    status = first_non_ok_status(proof_results) or "ok"
+    elapsed_sec = round(time.monotonic() - started, 3)
+    proof_results_path.write_text(json.dumps(proof_results, indent=2, sort_keys=True) + "\n")
+    result = {
+        **base_result(generation, run_dir, command, result_backend(args)),
+        "status": status,
+        "exit_code": test_exit_code(proof_results),
+        "elapsed_sec": elapsed_sec,
+        "timeout_sec": args.timeout,
+        "kani_mode": args.kani_mode,
+        "kani_jobs": args.kani_jobs,
+        "kani_proof_timeout_sec": args.kani_proof_timeout,
+        "kani_args": [*args.kani_arg, *shlex.split(args.kani_extra_args)],
+        "kani_proofs_reused": len(existing_results),
+        "kani_proofs_executed_this_run": len(pending_proofs),
+        "kani_proof_result_path": str(proof_results_path),
+        "stdout_tail": tail(stdout_path),
+        "stderr_tail": tail(stderr_path),
+        "first_error": first_error(stderr_path) or first_error(stdout_path) or first_result_error(proof_results),
+        "backend_output_count": int(float(generation.get("generated_test_module_count") or 0)),
+        "available_generated_tests": len(available_proofs),
+        "selected_generated_tests": len(available_proofs),
+        "cargo_test_result_sections": len(proof_results),
+        "cargo_test_ok_sections": sum(1 for result in proof_results if result["status"] == "ok"),
+        "tests_passed": sum(1 for result in proof_results if result["status"] == "ok"),
+        "tests_failed": sum(1 for result in proof_results if result["status"] == "fail"),
+        "tests_timeout": sum(1 for result in proof_results if result["status"] == "timeout"),
+        "tests_ignored": 0,
+        "tests_measured": 0,
+        "tests_filtered_out": 0,
+    }
+    (run_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    return result
+
+
+def run_official_kani_proofs(
+    proof_names, proof_jobs, run_one, proof_result_dir, deadline=None, proof_timeout=0, log_dir=None
+):
+    if proof_jobs <= 1 or len(proof_names) <= 1:
+        results = {}
+        for index, proof_name in enumerate(proof_names):
+            timeout = bounded_test_timeout(proof_timeout, deadline)
+            if proof_timeout is not None and proof_timeout <= 0 and deadline is None:
+                timeout = None
+            if timeout is not None and timeout <= 0:
+                for name in proof_names[index:]:
+                    result = suite_timeout_result(name, log_dir)
+                    write_official_kani_proof_result(proof_result_dir, name, result)
+                    results[name] = result
+                break
+            result = run_one(proof_name, timeout)
+            write_official_kani_proof_result(proof_result_dir, proof_name, result)
+            results[proof_name] = result
+        return results
+
+    results = {}
+    next_index = 0
+    index_lock = threading.Lock()
+
+    def worker():
+        nonlocal next_index
+        worker_results = {}
+        while True:
+            with index_lock:
+                if next_index >= len(proof_names):
+                    return worker_results
+                index = next_index
+                next_index += 1
+            proof_name = proof_names[index]
+            timeout = bounded_test_timeout(proof_timeout, deadline)
+            if proof_timeout is not None and proof_timeout <= 0 and deadline is None:
+                timeout = None
+            if timeout is not None and timeout <= 0:
+                result = suite_timeout_result(proof_name, log_dir)
+            else:
+                result = run_one(proof_name, timeout)
+            write_official_kani_proof_result(proof_result_dir, proof_name, result)
+            worker_results[proof_name] = result
+
+    with ThreadPoolExecutor(max_workers=proof_jobs) as executor:
+        futures = [executor.submit(worker) for _ in range(min(proof_jobs, len(proof_names)))]
+        for future in as_completed(futures):
+            results.update(future.result())
+    return results
+
+
+def write_official_kani_proof_result(proof_result_dir, proof_name, result):
+    proof_result_dir.mkdir(parents=True, exist_ok=True)
+    (proof_result_dir / f"{safe_log_stem(proof_name)}.json").write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def load_existing_official_kani_results(
+    proof_names, proof_result_dir, proof_log_dir, stdout_path, stderr_path
+):
+    results = {}
+    for proof_name in proof_names:
+        path = proof_result_dir / f"{safe_log_stem(proof_name)}.json"
+        if path.exists():
+            try:
+                results[proof_name] = json.loads(path.read_text())
+                continue
+            except json.JSONDecodeError:
+                pass
+        legacy = infer_legacy_official_kani_result(
+            proof_name, proof_log_dir, stdout_path, stderr_path
+        )
+        if legacy is not None:
+            results[proof_name] = legacy
+    return results
+
+
+def infer_legacy_official_kani_result(proof_name, proof_log_dir, stdout_path, stderr_path):
+    combined = "\n".join([tail(stdout_path, 200000), tail(stderr_path, 200000)])
+    if "Failed to get cargo metadata" in combined:
+        return None
+    timeout_marker = f"kani timeout after 1200s: {proof_name}"
+    exit_marker = f"kani exit "
+    proof_marker = f": {proof_name}"
+    if timeout_marker in combined:
+        status = "timeout"
+        exit_code = -999
+    else:
+        exit_match = re.search(rf"kani exit (?P<code>-?\d+): {re.escape(proof_name)}\\b", combined)
+        if not exit_match:
+            return None
+        status = "fail"
+        exit_code = int(exit_match.group("code"))
+    stdout_log = proof_log_dir / f"{safe_log_stem(proof_name)}.stdout.log"
+    stderr_log = proof_log_dir / f"{safe_log_stem(proof_name)}.stderr.log"
+    stdout_tail = tail(stdout_log)
+    stderr_tail = tail(stderr_log)
+    row = {
+        "name": proof_name,
+        "status": status,
+        "exit_code": exit_code,
+        "elapsed_sec": None,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+        "first_error": first_error_text(stderr_tail) or first_error_text(stdout_tail),
+        "unsoundness_kind": classify_unsoundness(stdout_tail, stderr_tail, status, exit_code),
+    }
+    if stdout_log.exists():
+        row["stdout_log"] = str(stdout_log)
+    if stderr_log.exists():
+        row["stderr_log"] = str(stderr_log)
+    return row
+
+
+def run_one_official_kani_proof(
+    base_command, proof_name, harness, env, stdout, stderr, timeout, log_dir, log_lock=None
+):
+    command = [*base_command, "--harness", proof_name]
+    write_log(stdout, f"\n[paper-backend-execution] running {' '.join(command)}\n", log_lock)
+    started = time.monotonic()
+    status = "ok"
+    exit_code, captured_stdout, captured_stderr, timed_out = run_command_capture(
+        command,
+        cwd=harness,
+        env=env,
+        timeout=timeout,
+    )
+    if timed_out:
+        status = "timeout"
+        write_log(
+            stderr,
+            f"\n[paper-backend-execution] kani timeout after {timeout}s: {proof_name}\n",
+            log_lock,
+        )
+    elif exit_code != 0:
+        status = "fail"
+        write_log(
+            stderr,
+            f"\n[paper-backend-execution] kani exit {exit_code}: {proof_name}\n",
+            log_lock,
+        )
+    return test_result_row(
+        proof_name,
+        status,
+        exit_code,
+        round(time.monotonic() - started, 3),
+        captured_stdout,
+        captured_stderr,
+        log_dir,
+    )
 
 
 def run_tests_backend(generation, args, run_dir, harness, env, command):
@@ -1223,6 +1716,11 @@ def remaining_suite_timeout(deadline):
     return max(0.0, deadline - time.monotonic())
 
 
+def suite_timed_out(deadline):
+    remaining = remaining_suite_timeout(deadline)
+    return remaining is not None and remaining <= 0
+
+
 def bounded_test_timeout(test_timeout, deadline):
     remaining = remaining_suite_timeout(deadline)
     if remaining is None:
@@ -1256,16 +1754,27 @@ def run_generated_tests(test_names, test_jobs, run_one, deadline=None, test_time
         return results
 
     results = [None] * len(test_names)
-    with ThreadPoolExecutor(max_workers=test_jobs) as executor:
-        futures = {}
-        for index, test_name in enumerate(test_names):
+    next_index = 0
+    index_lock = threading.Lock()
+
+    def worker():
+        nonlocal next_index
+        while True:
+            with index_lock:
+                if next_index >= len(test_names):
+                    return
+                index = next_index
+                next_index += 1
             timeout = bounded_test_timeout(test_timeout, deadline)
             if timeout is not None and timeout <= 0:
-                results[index] = suite_timeout_result(test_name, log_dir)
+                results[index] = suite_timeout_result(test_names[index], log_dir)
                 continue
-            futures[executor.submit(run_one, test_name, timeout)] = index
+            results[index] = run_one(test_names[index], timeout)
+
+    with ThreadPoolExecutor(max_workers=test_jobs) as executor:
+        futures = [executor.submit(worker) for _ in range(min(test_jobs, len(test_names)))]
         for future in as_completed(futures):
-            results[futures[future]] = future.result()
+            future.result()
     return [
         result if result is not None else suite_timeout_result(test_names[index], log_dir)
         for index, result in enumerate(results)
@@ -1493,12 +2002,29 @@ def generated_test_names(harness):
     return tests
 
 
+def generated_kani_proof_names(harness):
+    proofs = []
+    for path in sorted((harness / "src").glob("test_*.rs")):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        proofs.extend(re.findall(r"fn (kani_test_\d+)\s*\(", text))
+    return proofs
+
+
 def test_exit_code(test_results):
     if any(result["status"] == "timeout" for result in test_results):
         return -999
     if any(result["status"] == "fail" for result in test_results):
         return 1
     return 0
+
+
+def first_result_error(results):
+    for result in results:
+        if result.get("first_error"):
+            return result["first_error"]
+        if result.get("status") in ("fail", "timeout"):
+            return f"{result.get('name')}: {result.get('status')}"
+    return None
 
 
 def prepare_package_tmp_dirs(manifest):
@@ -1757,6 +2283,8 @@ def classify_unsoundness(stdout_text, stderr_text, status, exit_code):
         return "address_sanitizer"
     if "threadsanitizer" in lowered or "data race" in lowered:
         return "thread_sanitizer"
+    if "undefinedbehaviorsanitizer" in lowered:
+        return "undefined_behavior_sanitizer"
     if "miri has detected undefined behavior" in lowered:
         return "miri_undefined_behavior"
     if "is uninitialized" in lowered or "using uninitialized data" in lowered:
@@ -1769,6 +2297,8 @@ def classify_unsoundness(stdout_text, stderr_text, status, exit_code):
         return "misaligned_access"
     if exit_code and exit_code < 0:
         return "signal"
+    if "attempt to" in lowered and "overflow" in lowered:
+        return "arithmetic_overflow"
     if "panicked at" in lowered:
         return "panic"
     if status != "ok":
@@ -1993,14 +2523,6 @@ def gather_unsoundness_cases(rows):
     return cases
 
 
-HIGH_CONFIDENCE_FUZZ_UNSOUNDNESS = {
-    "address_sanitizer",
-    "memory_sanitizer",
-    "thread_sanitizer",
-    "unsafe_precondition",
-}
-
-
 def gather_fuzz_unsoundness_cases(row):
     path_text = row.get("fuzz_target_results_path")
     if not path_text:
@@ -2059,6 +2581,17 @@ def fuzz_target_observations(target):
             target.get("stderr_tail") or "",
         )
     ]
+    early_stop_info = target.get("fuzz_early_stop_info") or {}
+    if early_stop_info:
+        observations.append(
+            (
+                "early-stop-replay",
+                "fail",
+                early_stop_info.get("replay_exit_code"),
+                early_stop_info.get("replay_stdout_tail") or "",
+                early_stop_info.get("replay_stderr_tail") or "",
+            )
+        )
     for seed in target.get("seed_validation_results") or []:
         observations.append(
             (
