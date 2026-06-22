@@ -1,0 +1,87 @@
+{
+  "experiment": "obligation-sequence",
+  "synthesize": {
+    "csv": "misc/trophy_crates.csv",
+    "sources_dir": "tmp/paper-experiments/sources",
+    "out": "tmp/paper-experiments/runs",
+    "backends": [
+      "all"
+    ],
+    "jobs": 4,
+    "timeout": 7200,
+    "log_level": "info"
+  },
+  "configs": [
+    {
+      "name": "od_sequence_m4_d0",
+      "max_mutators": 4,
+      "max_depth": 0,
+      "max_sequences_per_target": 128,
+      "max_basic_sequences_per_target": 128
+    }
+  ],
+  "execute": {
+    "generation_results": "tmp/paper-experiments/runs/all_results.csv",
+    "out": "tmp/paper-experiments/backend-execution",
+    "runs": {
+      "kani": {
+        "backend": "kani",
+        "kani_mode": "config",
+        "kani_config": "scripts/config/kani-ab-coverage.json",
+        "jobs": 1,
+        "timeout": 0,
+        "force": true
+      },
+      "tests-asan": {
+        "backend": "tests",
+        "tests_runner": "asan",
+        "jobs": 4,
+        "timeout": 1800,
+        "test_timeout": 300,
+        "test_jobs": 2,
+        "force": true
+      },
+      "tests-msan": {
+        "backend": "tests",
+        "tests_runner": "sanitizer",
+        "sanitizer": "memory",
+        "jobs": 4,
+        "timeout": 1800,
+        "test_timeout": 300,
+        "test_jobs": 2,
+        "force": true
+      },
+      "tests-miri": {
+        "backend": "tests",
+        "tests_runner": "miri",
+        "jobs": 4,
+        "timeout": 1800,
+        "test_timeout": 300,
+        "test_jobs": 2,
+        "max_tests_per_crate": 5
+      },
+      "fuzz-asan": {
+        "backend": "fuzz",
+        "fuzz_sanitizer": "address",
+        "fuzz_targets": "all",
+        "jobs": 1,
+        "fuzz_jobs": 2,
+        "fuzz_time_limit": 86400,
+        "fuzz_target_timeout": 87000,
+        "fuzz_stop_on_crash": true,
+        "force": true
+      }
+    }
+  },
+  "analyze": {
+    "generation": "tmp/paper-experiments/runs/all_results.csv",
+    "execution_base": "tmp/paper-experiments/backend-execution/obligation-sequence/od_sequence_m4_d0",
+    "unsoundness_cases": "tmp/paper-experiments/backend-execution/unsoundness_cases.csv",
+    "out_dir": "tmp/paper-experiments/final_backend_summaries",
+    "generation_backend": "tests",
+    "run_backends": {
+      "asan": "tests-asan",
+      "miri": "tests-miri"
+    }
+  }
+}

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run paper-oriented cargo-4safer generation experiments.
+"""Synthesize cargo-4safer harness suites for configured crate experiments.
 
-The script reads misc/selected_crates.csv, fetches crate sources when needed,
-runs cargo-4safer with one selected synthesis configuration and one or more
-backends, and records per-run plus per-configuration metrics from foursafer_meta
-JSON files.
+The script reads a crate CSV, fetches crate sources when needed, runs
+cargo-4safer with one selected synthesis configuration and one or more backends,
+and records per-run plus per-configuration metrics from foursafer_meta JSON
+files.
 """
 
 import argparse
@@ -34,59 +34,61 @@ BIN = REPO / "target/debug/cargo-4safer"
 
 BACKENDS = ("kani", "tests", "fuzz")
 BACKEND_CHOICES = (*BACKENDS, "all")
+EXPERIMENT_CONFIG_FILES = (
+    REPO / "scripts/config/obligation_sequence.json",
+    REPO / "scripts/config/ablation_budget.json",
+)
 
-EXPERIMENTS = {
-    "obligation-sequence": [
-        {
-            "name": "od_sequence_m4_d0",
-            "max_mutators": 4,
-            "max_depth": 0,
-            "max_sequences_per_target": 8,
-            "max_basic_sequences_per_target": 8,
-        },
-    ],
-    "ablation": [
-        {
-            "name": "od_sequence_full",
-            "max_mutators": 4,
-            "max_depth": 0,
-            "env": {},
-        },
-        {
-            "name": "od_no_reuse_penalty",
-            "max_mutators": 4,
-            "max_depth": 0,
-            "disable_reuse": True,
-            "env": {},
-        },
-        {
-            "name": "od_no_depth_penalty",
-            "max_mutators": 4,
-            "max_depth": 0,
-            "disable_depth": True,
-            "env": {},
-        },
-        {
-            "name": "od_no_reuse_no_depth_penalty",
-            "max_mutators": 4,
-            "max_depth": 0,
-            "disable_reuse": True,
-            "disable_depth": True,
-            "env": {},
-        },
-        {
-            "name": "od_sequence_unlimited",
-            "max_mutators": 4,
-            "max_depth": 0,
-            "disable_sequence_limits": True,
-            "env": {},
-        },
-    ],
-}
+
+def load_experiment_config(path):
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    experiment = payload.get("experiment")
+    configs = payload.get("configs")
+    synthesize = payload.get("synthesize", {})
+    if not isinstance(experiment, str) or not experiment:
+        raise ValueError(f"{path} must define a non-empty experiment name")
+    if not isinstance(configs, list) or not configs:
+        raise ValueError(f"{path} must define a non-empty configs list")
+    if not isinstance(synthesize, dict):
+        raise ValueError(f"{path} synthesize must be an object when present")
+
+    seen_names = set()
+    for index, config in enumerate(configs, start=1):
+        if not isinstance(config, dict):
+            raise ValueError(f"{path} config #{index} must be an object")
+        name = config.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{path} config #{index} must define a non-empty name")
+        if name in seen_names:
+            raise ValueError(f"{path} defines duplicate config name: {name}")
+        seen_names.add(name)
+        for field in ("max_mutators", "max_depth"):
+            if field not in config:
+                raise ValueError(f"{path} config {name} must define {field}")
+    return experiment, {"configs": configs, "synthesize": synthesize}
+
+
+def load_experiments():
+    experiments = {}
+    for path in EXPERIMENT_CONFIG_FILES:
+        experiment, config = load_experiment_config(path)
+        if experiment in experiments:
+            raise ValueError(f"duplicate experiment definition: {experiment}")
+        experiments[experiment] = config
+    return experiments
+
+
+EXPERIMENTS = load_experiments()
 
 
 def config_names():
-    return sorted({config["name"] for configs in EXPERIMENTS.values() for config in configs})
+    return sorted({
+        config["name"]
+        for experiment in EXPERIMENTS.values()
+        for config in experiment["configs"]
+    })
 
 
 def load_selected_crates(csv_path):
@@ -928,7 +930,7 @@ def select_crates(all_crates, args):
 
 
 def select_configs(experiment, requested_configs):
-    configs = EXPERIMENTS[experiment]
+    configs = EXPERIMENTS[experiment]["configs"]
     if not requested_configs:
         return configs
     requested = set(requested_configs)
@@ -942,7 +944,7 @@ def select_configs(experiment, requested_configs):
 
 
 def selected_backends(args):
-    requested = args.backend or ["tests"]
+    requested = args.backend or []
     backends = []
     for backend in requested:
         if backend == "all":
@@ -953,6 +955,55 @@ def selected_backends(args):
             if candidate not in backends:
                 backends.append(candidate)
     return backends
+
+
+def resolve_repo_path(value, default):
+    if value is None:
+        return default
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return REPO / path
+
+
+def shared_synthesize_setting(experiments, key, default=None):
+    values = []
+    for experiment in experiments:
+        synthesize = EXPERIMENTS[experiment].get("synthesize", {})
+        if key in synthesize:
+            values.append(synthesize[key])
+    if not values:
+        return default
+    first = values[0]
+    if any(value != first for value in values[1:]):
+        names = ", ".join(experiments)
+        raise ValueError(f"--{key.replace('_', '-')} must be specified when experiments differ: {names}")
+    return first
+
+
+def apply_synthesize_defaults(args, experiments):
+    if args.csv is None:
+        args.csv = resolve_repo_path(shared_synthesize_setting(experiments, "csv"), DEFAULT_CSV)
+    if args.sources_dir is None:
+        args.sources_dir = resolve_repo_path(
+            shared_synthesize_setting(experiments, "sources_dir"),
+            DEFAULT_SOURCES,
+        )
+    if args.out is None:
+        args.out = resolve_repo_path(shared_synthesize_setting(experiments, "out"), DEFAULT_OUT)
+    if not args.backend:
+        configured_backends = shared_synthesize_setting(experiments, "backends", ["tests"])
+        if not isinstance(configured_backends, list):
+            raise ValueError("synthesize.backends must be a list")
+        args.backend = configured_backends
+    if args.timeout is None:
+        args.timeout = shared_synthesize_setting(experiments, "timeout", 7200)
+    if args.jobs is None:
+        args.jobs = shared_synthesize_setting(experiments, "jobs", 1)
+    if args.log_level is None:
+        args.log_level = shared_synthesize_setting(experiments, "log_level", "info")
+    if args.outer_timeout_grace is None:
+        args.outer_timeout_grace = shared_synthesize_setting(experiments, "outer_timeout_grace", 300)
 
 
 def gather_existing_results(out_dir):
@@ -979,9 +1030,9 @@ def normalize_result(row):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
-    parser.add_argument("--sources-dir", type=Path, default=DEFAULT_SOURCES)
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--csv", type=Path)
+    parser.add_argument("--sources-dir", type=Path)
+    parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--experiment",
         choices=sorted(EXPERIMENTS),
@@ -1017,10 +1068,10 @@ def main():
     parser.add_argument("--crate", action="append", default=[], help="Crate name or crate-version key.")
     parser.add_argument("--note", action="append", default=[], help="Filter selected_crates.csv by note.")
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--timeout", type=int, default=7200)
-    parser.add_argument("--outer-timeout-grace", type=int, default=300)
-    parser.add_argument("--jobs", type=int, default=1, help="Number of crates to process in parallel.")
-    parser.add_argument("--log-level", default="info", choices=("error", "warn", "info", "debug", "trace"))
+    parser.add_argument("--timeout", type=int)
+    parser.add_argument("--outer-timeout-grace", type=int)
+    parser.add_argument("--jobs", type=int, help="Number of crates to process in parallel.")
+    parser.add_argument("--log-level", choices=("error", "warn", "info", "debug", "trace"))
     parser.add_argument("--env", action="append", default=[], help="Extra environment override, KEY=VALUE.")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--skip-fetch", action="store_true")
@@ -1029,6 +1080,13 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--aggregate-existing", action="store_true")
     args = parser.parse_args()
+
+    experiments = args.experiment or ["obligation-sequence"]
+    try:
+        apply_synthesize_defaults(args, experiments)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
 
     args.out = args.out.resolve()
     args.sources_dir = args.sources_dir.resolve()
@@ -1051,7 +1109,6 @@ def main():
         print("no crates selected", file=sys.stderr)
         return 2
 
-    experiments = args.experiment or ["obligation-sequence"]
     try:
         experiment_configs = {
             experiment: select_configs(experiment, args.config) for experiment in experiments

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run generated backend targets from paper experiment outputs.
+"""Execute generated cargo-4safer backend harnesses.
 
-This script consumes generation results produced by paper_experiments.py and
+This script consumes generation results produced by suite_synthesize.py and
 executes the generated harness crates per crate/backend. Execution results are
-kept separate from generation metrics so failed backend runs do not overwrite
-the synthesis records.
+kept separate from synthesis metrics so failed backend runs do not overwrite the
+synthesis records.
 """
 
 import argparse
@@ -39,62 +39,157 @@ BACKENDS = ("tests", "fuzz", "kani")
 AFL_LEGACY_SAFE_SEED_GUARD = '        if data == b"\\0" {\n            return;\n        }\n'
 AFL_FUZZ_ENTRY = "    afl::fuzz!(|data: &[u8]| {\n"
 FUZZ_CRASH_REPLAY_TIMEOUT = 10
+DEFAULT_EXPERIMENT_CONFIG = REPO / "scripts/config/obligation_sequence.json"
+
+
+def load_experiment_config(path):
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return payload
+
+
+def repo_path(value, default=None):
+    if value is None:
+        return default
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return REPO / path
+
+
+def apply_run_defaults(args, require_backend=True):
+    config = load_experiment_config(args.experiment_config)
+    execute = config.get("execute", {})
+    if not isinstance(execute, dict):
+        raise ValueError(f"{args.experiment_config} execute must be an object")
+    runs = execute.get("runs", {})
+    if not isinstance(runs, dict):
+        raise ValueError(f"{args.experiment_config} execute.runs must be an object")
+
+    run = runs.get(args.run) if args.run else None
+    if args.run and run is None:
+        raise ValueError(f"{args.experiment_config} does not define execute run {args.run!r}")
+    if run is None:
+        run = {}
+    if not isinstance(run, dict):
+        raise ValueError(f"{args.experiment_config} execute run {args.run!r} must be an object")
+
+    if args.generation_results is None:
+        args.generation_results = repo_path(execute.get("generation_results"), DEFAULT_GENERATION)
+    if args.out is None:
+        args.out = repo_path(execute.get("out"), DEFAULT_OUT)
+    if args.experiment is None:
+        args.experiment = config.get("experiment") or "obligation-sequence"
+    if args.config is None:
+        args.config = run.get("config") or "od_sequence_m4_d0"
+    for name, default in (
+        ("backend", None),
+        ("timeout", 1800),
+        ("test_timeout", 300),
+        ("test_jobs", 1),
+        ("max_tests_per_crate", 0),
+        ("tests_runner", "asan"),
+        ("sanitizer", "address"),
+        ("sanitizer_target_triple", "x86_64-unknown-linux-gnu"),
+        ("jobs", 1),
+        ("fuzz_targets", "first"),
+        ("fuzz_jobs", 1),
+        ("fuzz_time_limit", 0),
+        ("fuzz_target_timeout", 0),
+        ("fuzz_sanitizer", "address"),
+        ("kani_mode", "config"),
+        ("kani_command", None),
+        ("kani_repo", DEFAULT_KANI_REPO),
+        ("kani_jobs", 1),
+        ("kani_proof_timeout", 1200),
+        ("kani_extra_args", ""),
+    ):
+        if getattr(args, name) is None:
+            setattr(args, name, run.get(name, default))
+    if args.kani_config is None:
+        args.kani_config = repo_path(run.get("kani_config"), DEFAULT_KANI_CONFIG)
+    if args.kani_dir is None:
+        args.kani_dir = repo_path(run.get("kani_dir"), DEFAULT_FOURSAFER_KANI_DIR)
+    for name in (
+        "force",
+        "keep_target",
+        "prepare_package_tmp",
+        "fuzz_stop_on_crash",
+        "reuse_fuzz_target_results",
+        "build_kani",
+        "prepare_kani",
+    ):
+        if getattr(args, name) is None:
+            setattr(args, name, bool(run.get(name, default_bool_for_execution_flag(name))))
+    if require_backend and args.backend is None:
+        raise ValueError("--backend is required unless selected by --run")
+
+
+def default_bool_for_execution_flag(name):
+    return {
+        "force": False,
+        "keep_target": False,
+        "prepare_package_tmp": True,
+        "fuzz_stop_on_crash": True,
+        "reuse_fuzz_target_results": True,
+        "build_kani": False,
+        "prepare_kani": True,
+    }[name]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--generation-results", type=Path, default=DEFAULT_GENERATION)
-    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    parser.add_argument("--experiment", default="obligation-sequence")
-    parser.add_argument("--config", default="od_sequence_m4_d0")
+    parser.add_argument("--experiment-config", type=Path, default=DEFAULT_EXPERIMENT_CONFIG)
+    parser.add_argument("--run", help="Named execute.runs entry from --experiment-config.")
+    parser.add_argument("--generation-results", type=Path)
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--experiment")
+    parser.add_argument("--config")
     parser.add_argument("--backend", choices=BACKENDS)
     parser.add_argument("--crate", action="append", default=[], help="Crate name or crate-version key.")
-    parser.add_argument("--timeout", type=int, default=1800)
-    parser.add_argument("--test-timeout", type=int, default=300)
-    parser.add_argument("--test-jobs", type=int, default=1, help="Number of generated tests to execute in parallel per crate.")
+    parser.add_argument("--timeout", type=int)
+    parser.add_argument("--test-timeout", type=int)
+    parser.add_argument("--test-jobs", type=int, help="Number of generated tests to execute in parallel per crate.")
     parser.add_argument(
         "--max-tests-per-crate",
         type=int,
-        default=0,
         help="Maximum generated tests to execute per crate; 0 means all generated tests.",
     )
     parser.add_argument(
         "--tests-runner",
         choices=("asan", "sanitizer", "native", "miri"),
-        default="asan",
         help="Execution mode for generated tests. Defaults to ASan; native is plain execution.",
     )
     parser.add_argument(
         "--sanitizer",
-        default="address",
         help="Sanitizer passed to -Zsanitizer when --tests-runner sanitizer is used; asan implies address.",
     )
-    parser.add_argument("--sanitizer-target-triple", default="x86_64-unknown-linux-gnu")
-    parser.add_argument("--jobs", type=int, default=1, help="Number of crates to execute in parallel.")
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--sanitizer-target-triple")
+    parser.add_argument("--jobs", type=int, help="Number of crates to execute in parallel.")
+    parser.add_argument("--force", action="store_true", default=None)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--keep-target", action="store_true")
-    parser.add_argument("--prepare-package-tmp", action="store_true", default=True)
+    parser.add_argument("--keep-target", action="store_true", default=None)
+    parser.add_argument("--prepare-package-tmp", action="store_true", default=None)
     parser.add_argument("--no-prepare-package-tmp", dest="prepare_package_tmp", action="store_false")
     parser.add_argument("--env", action="append", default=[], help="Extra environment override, KEY=VALUE.")
-    parser.add_argument("--fuzz-targets", choices=("first", "all"), default="first")
-    parser.add_argument("--fuzz-jobs", type=int, default=1, help="Number of fuzz targets to execute in parallel per crate.")
-    parser.add_argument("--fuzz-time-limit", type=int, default=0, help="Per-fuzz-target AFL -V time limit in seconds; 0 means use --timeout.")
-    parser.add_argument("--fuzz-target-timeout", type=int, default=0, help="Outer timeout in seconds for each fuzz target command; 0 means AFL -V time plus 600s.")
-    parser.add_argument("--fuzz-stop-on-crash", action="store_true", default=True, help="Stop the current fuzz target early after the first high-confidence UB finding.")
+    parser.add_argument("--fuzz-targets", choices=("first", "all"))
+    parser.add_argument("--fuzz-jobs", type=int, help="Number of fuzz targets to execute in parallel per crate.")
+    parser.add_argument("--fuzz-time-limit", type=int, help="Per-fuzz-target AFL -V time limit in seconds; 0 means use --timeout.")
+    parser.add_argument("--fuzz-target-timeout", type=int, help="Outer timeout in seconds for each fuzz target command; 0 means AFL -V time plus 600s.")
+    parser.add_argument("--fuzz-stop-on-crash", action="store_true", default=None, help="Stop the current fuzz target early after the first high-confidence UB finding.")
     parser.add_argument("--no-fuzz-stop-on-crash", dest="fuzz_stop_on_crash", action="store_false")
-    parser.add_argument("--reuse-fuzz-target-results", action="store_true", default=True, help="When rerunning with --force, reuse existing non-skipped fuzz target results and only execute missing/skipped targets.")
+    parser.add_argument("--reuse-fuzz-target-results", action="store_true", default=None, help="When rerunning with --force, reuse existing non-skipped fuzz target results and only execute missing/skipped targets.")
     parser.add_argument("--no-reuse-fuzz-target-results", dest="reuse_fuzz_target_results", action="store_false")
     parser.add_argument(
         "--fuzz-sanitizer",
         choices=("none", "address", "memory", "thread"),
-        default="address",
         help="Sanitizer used for AFL fuzz targets. Defaults to address (ASan); use none for native AFL.",
     )
     parser.add_argument(
         "--kani-mode",
         choices=("config", "codegen", "proof", "official-proof"),
-        default="config",
         help=(
             "Kani execution mode. config uses --kani-config verify_cmd; "
             "codegen/proof use --kani-command; official-proof runs each generated "
@@ -104,7 +199,6 @@ def main():
     parser.add_argument(
         "--kani-config",
         type=Path,
-        default=DEFAULT_KANI_CONFIG,
         help="JSON file containing verify_cmd for --kani-mode config.",
     )
     parser.add_argument(
@@ -112,17 +206,24 @@ def main():
         default=None,
         help="Kani wrapper command for codegen/proof mode, or override for the first verify_cmd token.",
     )
-    parser.add_argument("--kani-repo", default=DEFAULT_KANI_REPO)
-    parser.add_argument("--kani-dir", type=Path, default=DEFAULT_FOURSAFER_KANI_DIR)
-    parser.add_argument("--build-kani", action="store_true")
-    parser.add_argument("--prepare-kani", action="store_true", default=True)
+    parser.add_argument("--kani-repo")
+    parser.add_argument("--kani-dir", type=Path)
+    parser.add_argument("--build-kani", action="store_true", default=None)
+    parser.add_argument("--prepare-kani", action="store_true", default=None)
     parser.add_argument("--no-prepare-kani", dest="prepare_kani", action="store_false")
-    parser.add_argument("--kani-jobs", type=int, default=1, help="Number of Kani proof harnesses to execute in parallel per crate.")
-    parser.add_argument("--kani-proof-timeout", type=int, default=1200, help="Per-Kani-proof timeout in seconds for --kani-mode official-proof.")
+    parser.add_argument("--kani-jobs", type=int, help="Number of Kani proof harnesses to execute in parallel per crate.")
+    parser.add_argument("--kani-proof-timeout", type=int, help="Per-Kani-proof timeout in seconds for --kani-mode official-proof.")
     parser.add_argument("--kani-arg", action="append", default=[], help="Extra argument passed to each official cargo kani invocation.")
-    parser.add_argument("--kani-extra-args", default="", help="Shell-style extra arguments passed to each official cargo kani invocation.")
+    parser.add_argument("--kani-extra-args", help="Shell-style extra arguments passed to each official cargo kani invocation.")
     parser.add_argument("--aggregate-existing", action="store_true")
     args = parser.parse_args()
+
+    args.experiment_config = args.experiment_config.resolve()
+    try:
+        apply_run_defaults(args, require_backend=not args.aggregate_existing)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 2
 
     args.out = args.out.resolve()
     args.kani_config = args.kani_config.resolve()
@@ -797,7 +898,7 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
                     for target in run_targets
                     for command in (
                         f"mkdir -p {target['afl_input_dir']}",
-                        "# AFL input seeds are validated and written by paper_backend_execution.py",
+                        "# AFL input seeds are validated and written by suite_execute.py",
                         " ".join(target["build_command"]),
                         " ".join(target["command"]),
                     )
@@ -933,7 +1034,7 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
     fuzz_early_stop_info = None
     try:
         with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
-            write_log(stdout, f"\n[paper-backend-execution] running {' '.join(build_command)}\n", None)
+            write_log(stdout, f"\n[suite-execute] running {' '.join(build_command)}\n", None)
             completed = run_command(
                 build_command,
                 cwd=harness,
@@ -954,7 +1055,7 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
                 write_log(
                     stdout,
                     (
-                        "\n[paper-backend-execution] validated "
+                        "\n[suite-execute] validated "
                         f"{len(valid_seed_results)}/{len(seed_validation_results)} AFL seeds "
                         f"for {target_name} (min_data_len={seed_min_data_len})\n"
                     ),
@@ -968,7 +1069,7 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
                         f"{target_name}: no non-crashing AFL seed candidate "
                         f"(min_data_len={seed_min_data_len})"
                     )
-                    write_log(stdout, f"[paper-backend-execution] {seed_validation_error}\n", None)
+                    write_log(stdout, f"[suite-execute] {seed_validation_error}\n", None)
                 else:
                     prepare_afl_input_dir(input_dir, valid_seed_results)
                     fuzz_time_limit = fuzz_target_time_limit(args)
@@ -982,7 +1083,7 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
                         run_dir / "target",
                         fuzz_time_limit,
                     )
-                    write_log(stdout, f"\n[paper-backend-execution] running {' '.join(command)}\n", None)
+                    write_log(stdout, f"\n[suite-execute] running {' '.join(command)}\n", None)
                     fuzz_ran = True
                     completed, fuzz_early_stop_info = run_fuzz_command(
                         command,
@@ -1358,7 +1459,7 @@ def run_official_kani_backend(generation, args, run_dir, harness, env, command):
             write_log(
                 stdout,
                 (
-                    "[paper-backend-execution] reusing "
+                    "[suite-execute] reusing "
                     f"{len(existing_results)} existing Kani proof results\n"
                 ),
                 None,
@@ -1541,7 +1642,7 @@ def run_one_official_kani_proof(
     base_command, proof_name, harness, env, stdout, stderr, timeout, log_dir, log_lock=None
 ):
     command = [*base_command, "--harness", proof_name]
-    write_log(stdout, f"\n[paper-backend-execution] running {' '.join(command)}\n", log_lock)
+    write_log(stdout, f"\n[suite-execute] running {' '.join(command)}\n", log_lock)
     started = time.monotonic()
     status = "ok"
     exit_code, captured_stdout, captured_stderr, timed_out = run_command_capture(
@@ -1554,14 +1655,14 @@ def run_one_official_kani_proof(
         status = "timeout"
         write_log(
             stderr,
-            f"\n[paper-backend-execution] kani timeout after {timeout}s: {proof_name}\n",
+            f"\n[suite-execute] kani timeout after {timeout}s: {proof_name}\n",
             log_lock,
         )
     elif exit_code != 0:
         status = "fail"
         write_log(
             stderr,
-            f"\n[paper-backend-execution] kani exit {exit_code}: {proof_name}\n",
+            f"\n[suite-execute] kani exit {exit_code}: {proof_name}\n",
             log_lock,
         )
     return test_result_row(
@@ -1636,7 +1737,7 @@ def run_tests_backend(generation, args, run_dir, harness, env, command):
                 if binary is None:
                     status = "fail"
                     stderr.write(
-                        b"\n[paper-backend-execution] failed to discover generated test binary\n"
+                        b"\n[suite-execute] failed to discover generated test binary\n"
                     )
                 else:
                     test_log_dir = run_dir / "test_logs"
@@ -1737,7 +1838,7 @@ def suite_timeout_result(test_name, log_dir):
         -999,
         0.0,
         b"",
-        b"[paper-backend-execution] suite timeout before running this generated test\n",
+        b"[suite-execute] suite timeout before running this generated test\n",
         log_dir,
     )
 
@@ -1792,7 +1893,7 @@ def run_one_generated_test_with_miri(
     base_command, test_name, harness, env, stdout, stderr, timeout, log_dir, log_lock=None
 ):
     command = [*base_command, test_name, "--", "--exact", "--nocapture"]
-    write_log(stdout, f"\n[paper-backend-execution] running {' '.join(command)}\n", log_lock)
+    write_log(stdout, f"\n[suite-execute] running {' '.join(command)}\n", log_lock)
     started = time.monotonic()
     status = "ok"
     exit_code, captured_stdout, captured_stderr, timed_out = run_command_capture(
@@ -1805,14 +1906,14 @@ def run_one_generated_test_with_miri(
         status = "timeout"
         write_log(
             stderr,
-            f"\n[paper-backend-execution] miri timeout after {timeout}s: {test_name}\n",
+            f"\n[suite-execute] miri timeout after {timeout}s: {test_name}\n",
             log_lock,
         )
     elif exit_code != 0:
         status = "fail"
         write_log(
             stderr,
-            f"\n[paper-backend-execution] miri exit {exit_code}: {test_name}\n",
+            f"\n[suite-execute] miri exit {exit_code}: {test_name}\n",
             log_lock,
         )
     return test_result_row(
@@ -1828,7 +1929,7 @@ def run_one_generated_test_with_miri(
 
 def run_one_generated_test(binary, test_name, harness, env, stdout, stderr, timeout, log_dir, log_lock=None):
     command = [str(binary), test_name, "--exact", "--nocapture"]
-    write_log(stdout, f"\n[paper-backend-execution] running {' '.join(command)}\n", log_lock)
+    write_log(stdout, f"\n[suite-execute] running {' '.join(command)}\n", log_lock)
     started = time.monotonic()
     status = "ok"
     exit_code, captured_stdout, captured_stderr, timed_out = run_command_capture(
@@ -1841,14 +1942,14 @@ def run_one_generated_test(binary, test_name, harness, env, stdout, stderr, time
         status = "timeout"
         write_log(
             stderr,
-            f"\n[paper-backend-execution] timeout after {timeout}s: {test_name}\n",
+            f"\n[suite-execute] timeout after {timeout}s: {test_name}\n",
             log_lock,
         )
     elif exit_code != 0:
         status = "fail"
         write_log(
             stderr,
-            f"\n[paper-backend-execution] exit {exit_code}: {test_name}\n",
+            f"\n[suite-execute] exit {exit_code}: {test_name}\n",
             log_lock,
         )
     return test_result_row(
@@ -2285,7 +2386,15 @@ def classify_unsoundness(stdout_text, stderr_text, status, exit_code):
         return "thread_sanitizer"
     if "undefinedbehaviorsanitizer" in lowered:
         return "undefined_behavior_sanitizer"
-    if "miri has detected undefined behavior" in lowered:
+    if "error: undefined behavior:" in lowered or "miri has detected undefined behavior" in lowered:
+        if "uninitialized" in lowered or "invalid value" in lowered:
+            return "miri_ub_uninitialized_or_invalid_value"
+        if "out-of-bounds" in lowered or "out of bounds" in lowered:
+            return "miri_ub_out_of_bounds"
+        if "dangling" in lowered or "use-after-free" in lowered:
+            return "miri_ub_use_after_free"
+        if "misaligned" in lowered:
+            return "miri_ub_misaligned"
         return "miri_undefined_behavior"
     if "is uninitialized" in lowered or "using uninitialized data" in lowered:
         return "uninitialized"
