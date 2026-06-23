@@ -15,10 +15,12 @@ Container helper scripts are kept separate:
 
 Experiment parameters live under `scripts/config/`.
 
-- `obligation_sequence.json`: main sequence-limited synthesis experiment, backend execution profiles, and final analysis defaults.
-- `ablation_budget.json`: budget/penalty ablation synthesis experiment.
+- `budgeted.json`: budgeted obligation-driven synthesis experiment, backend execution profiles, and final analysis defaults.
+- `no_ranking.json`: ranking ablation experiment; it matches `budgeted.json` except that `synthesize.cmd_args` also includes `--disable-ranking`.
 
-The JSON files intentionally include both synthesis parameters and run parameters such as `timeout`, `jobs`, output paths, and backend execution limits. CLI flags still override JSON defaults for one-off reruns.
+The JSON files keep shared artifact locations in top-level `paths`, synthesis defaults in `synthesize`, and backend-specific execution profiles in `execute.runs`. Backend execution defaults to one crate at a time; tests, fuzz targets, and Kani proof harnesses can still use per-crate internal parallelism through `test_jobs`, `fuzz_jobs`, and `kani_jobs`. CLI flags still override JSON defaults for one-off reruns.
+
+Use `synthesize.cmd_args` for `cargo 4safer` synthesis arguments. The top-level `experiment` names the synthesis profile used in output paths and result rows.
 
 ## Main Trophy Workflow
 
@@ -26,24 +28,14 @@ Synthesize the main suites for `misc/trophy_crates.csv`:
 
 ```bash
 python3 scripts/suite_synthesize.py \
-  --experiment obligation-sequence \
-  --config od_sequence_m4_d0
+  --experiment obligation-sequence
 ```
 
-Run the budget/penalty ablations:
+Run the no-ranking ablation:
 
 ```bash
-for config in \
-  od_sequence_full \
-  od_no_reuse_penalty \
-  od_no_depth_penalty \
-  od_no_reuse_no_depth_penalty \
-  od_sequence_unlimited
-do
-  python3 scripts/suite_synthesize.py \
-    --experiment ablation \
-    --config "$config"
-done
+python3 scripts/suite_synthesize.py \
+  --experiment no_ranking
 ```
 
 Refresh synthesis summaries without rerunning synthesis:
@@ -52,12 +44,11 @@ Refresh synthesis summaries without rerunning synthesis:
 python3 scripts/suite_synthesize.py --aggregate-existing
 ```
 
-Execute generated backend harnesses using profiles from `obligation_sequence.json`:
+Execute generated backend harnesses using profiles from `budgeted.json`:
 
 ```bash
 python3 scripts/suite_execute.py --run kani
 python3 scripts/suite_execute.py --run tests-asan
-python3 scripts/suite_execute.py --run tests-msan
 python3 scripts/suite_execute.py --run tests-miri
 python3 scripts/suite_execute.py --run fuzz-asan
 ```
@@ -85,7 +76,6 @@ python3 scripts/suite_synthesize.py \
   --out tmp/popular-unsafe-obligation-sequence/generation \
   --skip-fetch \
   --experiment obligation-sequence \
-  --config od_sequence_m4_d0 \
   --backend tests \
   --backend kani \
   --jobs 16 \
@@ -99,28 +89,20 @@ python3 scripts/suite_execute.py \
   --generation-results tmp/popular-unsafe-obligation-sequence/generation/all_results.csv \
   --out tmp/popular-unsafe-obligation-sequence/backend-execution \
   --experiment obligation-sequence \
-  --config od_sequence_m4_d0 \
   --backend tests \
   --tests-runner sanitizer \
   --sanitizer memory \
-  --jobs 4 \
-  --timeout 1800 \
   --test-timeout 300 \
-  --test-jobs 1 \
-  --max-tests-per-crate 5
+  --test-jobs 16
 
 python3 scripts/suite_execute.py \
   --generation-results tmp/popular-unsafe-obligation-sequence/generation/all_results.csv \
   --out tmp/popular-unsafe-obligation-sequence/backend-execution \
   --experiment obligation-sequence \
-  --config od_sequence_m4_d0 \
   --backend tests \
   --tests-runner miri \
-  --jobs 4 \
-  --timeout 1800 \
   --test-timeout 300 \
-  --test-jobs 1 \
-  --max-tests-per-crate 5
+  --test-jobs 16
 
 python3 scripts/suite_execute.py \
   --out tmp/popular-unsafe-obligation-sequence/backend-execution \

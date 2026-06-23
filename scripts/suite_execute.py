@@ -27,7 +27,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_GENERATION = REPO / "tmp/paper-experiments/runs/all_results.csv"
 DEFAULT_OUT = REPO / "tmp/paper-experiments/backend-execution"
-DEFAULT_KANI_CONFIG = REPO / "scripts/config/kani-ab-coverage.json"
 DEFAULT_KANI_REPO = "git@github.com:mirthfulLee/varies_kani.git"
 if "FOURSAFER_KANI_DIR" in os.environ:
     DEFAULT_FOURSAFER_KANI_DIR = Path(os.environ["FOURSAFER_KANI_DIR"])
@@ -39,7 +38,7 @@ BACKENDS = ("tests", "fuzz", "kani")
 AFL_LEGACY_SAFE_SEED_GUARD = '        if data == b"\\0" {\n            return;\n        }\n'
 AFL_FUZZ_ENTRY = "    afl::fuzz!(|data: &[u8]| {\n"
 FUZZ_CRASH_REPLAY_TIMEOUT = 10
-DEFAULT_EXPERIMENT_CONFIG = REPO / "scripts/config/obligation_sequence.json"
+DEFAULT_EXPERIMENT_CONFIG = REPO / "scripts/config/budgeted.json"
 
 
 def load_experiment_config(path):
@@ -57,6 +56,24 @@ def repo_path(value, default=None):
     if path.is_absolute():
         return path
     return REPO / path
+
+
+def configured_path(config, key, default=None):
+    paths = config.get("paths", {})
+    if not isinstance(paths, dict):
+        raise ValueError(f"{DEFAULT_EXPERIMENT_CONFIG} paths must be an object")
+    return repo_path(paths.get(key), default)
+
+
+def configured_generation_results(config, execute):
+    if execute.get("generation_results") is not None:
+        return repo_path(execute.get("generation_results"), DEFAULT_GENERATION)
+    if configured_path(config, "generation_results") is not None:
+        return configured_path(config, "generation_results")
+    generation_out = configured_path(config, "generation_out")
+    if generation_out is not None:
+        return generation_out / "all_results.csv"
+    return DEFAULT_GENERATION
 
 
 def apply_run_defaults(args, require_backend=True):
@@ -77,23 +94,22 @@ def apply_run_defaults(args, require_backend=True):
         raise ValueError(f"{args.experiment_config} execute run {args.run!r} must be an object")
 
     if args.generation_results is None:
-        args.generation_results = repo_path(execute.get("generation_results"), DEFAULT_GENERATION)
+        args.generation_results = configured_generation_results(config, execute)
     if args.out is None:
-        args.out = repo_path(execute.get("out"), DEFAULT_OUT)
+        args.out = repo_path(execute.get("out"), configured_path(config, "execution_out", DEFAULT_OUT))
     if args.experiment is None:
         args.experiment = config.get("experiment") or "obligation-sequence"
     if args.config is None:
-        args.config = run.get("config") or "od_sequence_m4_d0"
+        args.config = run.get("config") or args.experiment
+    args.kani_verify_cmd = run.get("verify_cmd") or execute.get("verify_cmd")
     for name, default in (
         ("backend", None),
-        ("timeout", 1800),
+        ("timeout", 0),
         ("test_timeout", 300),
         ("test_jobs", 1),
-        ("max_tests_per_crate", 0),
         ("tests_runner", "asan"),
         ("sanitizer", "address"),
         ("sanitizer_target_triple", "x86_64-unknown-linux-gnu"),
-        ("jobs", 1),
         ("fuzz_targets", "first"),
         ("fuzz_jobs", 1),
         ("fuzz_time_limit", 0),
@@ -108,8 +124,6 @@ def apply_run_defaults(args, require_backend=True):
     ):
         if getattr(args, name) is None:
             setattr(args, name, run.get(name, default))
-    if args.kani_config is None:
-        args.kani_config = repo_path(run.get("kani_config"), DEFAULT_KANI_CONFIG)
     if args.kani_dir is None:
         args.kani_dir = repo_path(run.get("kani_dir"), DEFAULT_FOURSAFER_KANI_DIR)
     for name in (
@@ -153,11 +167,6 @@ def main():
     parser.add_argument("--test-timeout", type=int)
     parser.add_argument("--test-jobs", type=int, help="Number of generated tests to execute in parallel per crate.")
     parser.add_argument(
-        "--max-tests-per-crate",
-        type=int,
-        help="Maximum generated tests to execute per crate; 0 means all generated tests.",
-    )
-    parser.add_argument(
         "--tests-runner",
         choices=("asan", "sanitizer", "native", "miri"),
         help="Execution mode for generated tests. Defaults to ASan; native is plain execution.",
@@ -167,7 +176,6 @@ def main():
         help="Sanitizer passed to -Zsanitizer when --tests-runner sanitizer is used; asan implies address.",
     )
     parser.add_argument("--sanitizer-target-triple")
-    parser.add_argument("--jobs", type=int, help="Number of crates to execute in parallel.")
     parser.add_argument("--force", action="store_true", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-target", action="store_true", default=None)
@@ -191,15 +199,10 @@ def main():
         "--kani-mode",
         choices=("config", "codegen", "proof", "official-proof"),
         help=(
-            "Kani execution mode. config uses --kani-config verify_cmd; "
+            "Kani execution mode. config uses inline verify_cmd; "
             "codegen/proof use --kani-command; official-proof runs each generated "
             "kani::proof harness with cargo kani."
         ),
-    )
-    parser.add_argument(
-        "--kani-config",
-        type=Path,
-        help="JSON file containing verify_cmd for --kani-mode config.",
     )
     parser.add_argument(
         "--kani-command",
@@ -226,7 +229,6 @@ def main():
         return 2
 
     args.out = args.out.resolve()
-    args.kani_config = args.kani_config.resolve()
     args.kani_dir = args.kani_dir.resolve()
 
     if args.aggregate_existing:
@@ -250,36 +252,12 @@ def main():
         return 2
 
     rows = []
-    jobs = max(1, args.jobs)
-    if jobs == 1:
-        for completed, generation in enumerate(generation_rows, start=1):
-            row = execute_one_generation(generation, args, completed, len(generation_rows))
-            if row is not None:
-                rows.append(row)
-                if not args.dry_run:
-                    write_summaries(gather_existing_results(args.out), args.out)
-    else:
-        with ThreadPoolExecutor(max_workers=jobs) as executor:
-            futures = {
-                executor.submit(run_backend, generation, args): (index, generation)
-                for index, generation in enumerate(generation_rows, start=1)
-            }
-            for future in as_completed(futures):
-                index, generation = futures[future]
-                key = crate_key(generation)
-                try:
-                    row = future.result()
-                except Exception as error:
-                    print(f"[execute-error] {key}: {error}", file=sys.stderr, flush=True)
-                    continue
-                rows.append(row)
-                print(
-                    f"[{len(rows)}/{len(generation_rows)} done; slot {index}] executed {key} "
-                    f"{generation['experiment']}/{generation['config']} backend={result_backend(args)}",
-                    flush=True,
-                )
-                if not args.dry_run:
-                    write_summaries(gather_existing_results(args.out), args.out)
+    for completed, generation in enumerate(generation_rows, start=1):
+        row = execute_one_generation(generation, args, completed, len(generation_rows))
+        if row is not None:
+            rows.append(row)
+            if not args.dry_run:
+                write_summaries(gather_existing_results(args.out), args.out)
 
     if rows and not args.dry_run:
         write_summaries(gather_existing_results(args.out), args.out)
@@ -323,7 +301,7 @@ def load_generation_rows(args):
 
 def run_backend(generation, args):
     key = crate_key(generation)
-    run_dir = args.out / generation["experiment"] / generation["config"] / result_backend(args) / key
+    run_dir = args.out / generation["experiment"] / result_backend(args) / key
     result_path = run_dir / "result.json"
     if result_path.exists() and not args.force:
         return json.loads(result_path.read_text())
@@ -578,33 +556,20 @@ def command_backend_name(command):
 
 
 def configured_kani_command(args):
-    config = read_kani_config(args.kani_config)
-    command = list(config.get("verify_cmd") or [])
+    command = list(args.kani_verify_cmd or [])
     if not command:
-        raise RuntimeError(f"{args.kani_config} does not define a non-empty verify_cmd")
+        raise RuntimeError("Kani config mode requires a non-empty inline verify_cmd")
     if args.kani_command:
         command[0] = args.kani_command
     return command
 
 
-def read_kani_config(path):
-    try:
-        with path.open(encoding="utf-8") as handle:
-            config = json.load(handle)
-    except FileNotFoundError as error:
-        raise RuntimeError(f"missing Kani config: {path}") from error
-    if not isinstance(config, dict):
-        raise RuntimeError(f"Kani config must be a JSON object: {path}")
-    return config
-
-
 def prepare_kani(args):
     source = args.kani_dir
     if not source.exists():
-        repo = configured_kani_repo(args)
         source.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            ["git", "clone", repo, str(source)],
+            ["git", "clone", args.kani_repo, str(source)],
             check=True,
         )
     wrapper = source / "scripts" / "cargo-4safer-kani"
@@ -618,17 +583,6 @@ def prepare_kani(args):
             f"missing varies_kani cargo-kani binary: {cargo_kani}. "
             "Run with --build-kani or build varies_kani before the experiment."
         )
-
-
-def configured_kani_repo(args):
-    if args.kani_config.exists():
-        config = read_kani_config(args.kani_config)
-        varies_kani = config.get("varies_kani") or {}
-        repo = varies_kani.get("repo")
-        if repo:
-            return repo
-    return args.kani_repo
-
 
 def apply_kani_env(args, env):
     if args.kani_mode == "official-proof":
@@ -1687,10 +1641,7 @@ def run_tests_backend(generation, args, run_dir, harness, env, command):
     binary = None
     suite_deadline = suite_deadline_from_timeout(started, args.timeout)
     available_test_names = generated_test_names(harness)
-    if args.max_tests_per_crate > 0:
-        test_names = available_test_names[: args.max_tests_per_crate]
-    else:
-        test_names = available_test_names
+    test_names = available_test_names
     log_lock = threading.Lock()
 
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
@@ -1774,7 +1725,6 @@ def run_tests_backend(generation, args, run_dir, harness, env, command):
         "timeout_sec": args.timeout,
         "test_timeout_sec": args.test_timeout,
         "test_jobs": args.test_jobs,
-        "max_tests_per_crate": args.max_tests_per_crate,
         "tests_runner": args.tests_runner,
         "sanitizer": selected_sanitizer(args) if is_sanitizer_runner(args) else None,
         "sanitizer_build_std": sanitizer_needs_build_std(selected_sanitizer(args))
@@ -2434,7 +2384,11 @@ def safe_log_stem(test_name):
 
 def gather_existing_results(out_dir):
     rows = []
-    for path in sorted(out_dir.glob("*/*/*/*/result.json")):
+    paths = {
+        *out_dir.glob("*/*/*/result.json"),
+        *out_dir.glob("*/*/*/*/result.json"),
+    }
+    for path in sorted(paths):
         try:
             rows.append(json.loads(path.read_text()))
         except (FileNotFoundError, json.JSONDecodeError):

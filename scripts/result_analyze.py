@@ -25,11 +25,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_EXPERIMENT_ROOT = REPO / "tmp/paper-experiments"
 DEFAULT_GENERATION = DEFAULT_EXPERIMENT_ROOT / "runs/all_results.csv"
-DEFAULT_EXEC_BASE = DEFAULT_EXPERIMENT_ROOT / "backend-execution/obligation-sequence/od_sequence_m4_d0"
+DEFAULT_EXEC_BASE = DEFAULT_EXPERIMENT_ROOT / "backend-execution/obligation-sequence"
 DEFAULT_UNSOUNDNESS_CASES = DEFAULT_EXPERIMENT_ROOT / "backend-execution/unsoundness_cases.csv"
 DEFAULT_OUT_DIR = DEFAULT_EXPERIMENT_ROOT / "final_backend_summaries"
 DEFAULT_GENERATION_BACKEND = "tests"
-DEFAULT_EXPERIMENT_CONFIG = REPO / "scripts/config/obligation_sequence.json"
+DEFAULT_EXPERIMENT_CONFIG = REPO / "scripts/config/budgeted.json"
 
 RUN_BACKENDS = {
     "asan": "tests-asan",
@@ -170,17 +170,53 @@ def parse_args():
 def load_analyze_defaults(path):
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
+    paths = payload.get("paths", {})
+    if not isinstance(paths, dict):
+        raise SystemExit(f"{path} paths must be an object")
     analyze = payload.get("analyze", {})
     if not isinstance(analyze, dict):
         raise SystemExit(f"{path} analyze must be an object")
+    experiment = payload.get("experiment") or "obligation-sequence"
+    generation = repo_path(
+        analyze.get("generation")
+        or paths.get("generation_results")
+        or derived_generation_results(paths),
+        DEFAULT_GENERATION,
+    )
+    execution_base = repo_path(
+        analyze.get("execution_base")
+        or paths.get("execution_base")
+        or derived_execution_base(paths, experiment),
+        DEFAULT_EXEC_BASE,
+    )
     return {
-        "generation": repo_path(analyze.get("generation"), DEFAULT_GENERATION),
-        "execution_base": repo_path(analyze.get("execution_base"), DEFAULT_EXEC_BASE),
-        "unsoundness_cases": repo_path(analyze.get("unsoundness_cases"), DEFAULT_UNSOUNDNESS_CASES),
-        "out_dir": repo_path(analyze.get("out_dir"), DEFAULT_OUT_DIR),
+        "generation": generation,
+        "execution_base": execution_base,
+        "unsoundness_cases": repo_path(
+            analyze.get("unsoundness_cases") or paths.get("unsoundness_cases"),
+            DEFAULT_UNSOUNDNESS_CASES,
+        ),
+        "out_dir": repo_path(
+            analyze.get("out_dir") or paths.get("analysis_out"),
+            DEFAULT_OUT_DIR,
+        ),
         "generation_backend": analyze.get("generation_backend") or DEFAULT_GENERATION_BACKEND,
         "run_backends": parse_analyze_run_backends(analyze.get("run_backends")),
     }
+
+
+def derived_generation_results(paths):
+    generation_out = paths.get("generation_out")
+    if generation_out is None:
+        return None
+    return str(Path(generation_out) / "all_results.csv")
+
+
+def derived_execution_base(paths, experiment):
+    execution_out = paths.get("execution_out")
+    if execution_out is None:
+        return None
+    return str(Path(execution_out) / experiment)
 
 
 def repo_path(value, default):

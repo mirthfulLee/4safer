@@ -1,0 +1,92 @@
+{
+  "experiment": "no_ranking",
+  "paths": {
+    "csv": "misc/trophy_crates.csv",
+    "sources_dir": "tmp/paper-experiments/sources",
+    "generation_out": "tmp/paper-experiments/runs",
+    "execution_out": "tmp/paper-experiments/backend-execution",
+    "unsoundness_cases": "tmp/paper-experiments/backend-execution/unsoundness_cases.csv",
+    "analysis_out": "tmp/paper-experiments/final_backend_summaries"
+  },
+  "synthesize": {
+    "backends": [
+      "all"
+    ],
+    "jobs": 4,
+    "timeout": 7200,
+    "log_level": "info",
+    "cmd_args": [
+      "--disable-ranking",
+      "--max-mutators",
+      "4",
+      "--max-depth",
+      "0",
+      "--max-sequences-per-wrapper",
+      "512",
+      "--floor-sequences-per-target",
+      "16",
+      "--max-sequences-per-target",
+      "64"
+    ]
+  },
+  "execute": {
+    "runs": {
+      "kani": {
+        "backend": "kani",
+        "kani_mode": "config",
+        "verify_cmd": [
+          "cargo-4safer-kani",
+          "--output-format",
+          "terse",
+          "--default-unwind",
+          "4",
+          "--no-unwinding-checks",
+          "--prove-safety-only",
+          "--ignore-global-asm",
+          "--no-undefined-function-checks",
+          "-Z",
+          "unstable-options",
+          "--concrete-playback",
+          "inplace",
+          "-Z",
+          "concrete-playback",
+          "--jobs",
+          "2",
+          "--harness-timeout",
+          "20m"
+        ],
+        "force": true
+      },
+      "tests-asan": {
+        "backend": "tests",
+        "tests_runner": "asan",
+        "test_timeout": 600,
+        "test_jobs": 64,
+        "force": true
+      },
+      "tests-miri": {
+        "backend": "tests",
+        "tests_runner": "miri",
+        "test_timeout": 600,
+        "test_jobs": 64
+      },
+      "fuzz-asan": {
+        "backend": "fuzz",
+        "fuzz_sanitizer": "address",
+        "fuzz_targets": "all",
+        "fuzz_jobs": 2,
+        "fuzz_time_limit": 86400,
+        "fuzz_target_timeout": 87000,
+        "fuzz_stop_on_crash": true,
+        "force": true
+      }
+    }
+  },
+  "analyze": {
+    "generation_backend": "tests",
+    "run_backends": {
+      "asan": "tests-asan",
+      "miri": "tests-miri"
+    }
+  }
+}

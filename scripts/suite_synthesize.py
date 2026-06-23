@@ -35,8 +35,8 @@ BIN = REPO / "target/debug/cargo-4safer"
 BACKENDS = ("kani", "tests", "fuzz")
 BACKEND_CHOICES = (*BACKENDS, "all")
 EXPERIMENT_CONFIG_FILES = (
-    REPO / "scripts/config/obligation_sequence.json",
-    REPO / "scripts/config/ablation_budget.json",
+    REPO / "scripts/config/budgeted.json",
+    REPO / "scripts/config/no_ranking.json",
 )
 
 
@@ -45,29 +45,15 @@ def load_experiment_config(path):
         payload = json.load(handle)
 
     experiment = payload.get("experiment")
-    configs = payload.get("configs")
+    paths = payload.get("paths", {})
     synthesize = payload.get("synthesize", {})
     if not isinstance(experiment, str) or not experiment:
         raise ValueError(f"{path} must define a non-empty experiment name")
-    if not isinstance(configs, list) or not configs:
-        raise ValueError(f"{path} must define a non-empty configs list")
+    if not isinstance(paths, dict):
+        raise ValueError(f"{path} paths must be an object when present")
     if not isinstance(synthesize, dict):
         raise ValueError(f"{path} synthesize must be an object when present")
-
-    seen_names = set()
-    for index, config in enumerate(configs, start=1):
-        if not isinstance(config, dict):
-            raise ValueError(f"{path} config #{index} must be an object")
-        name = config.get("name")
-        if not isinstance(name, str) or not name:
-            raise ValueError(f"{path} config #{index} must define a non-empty name")
-        if name in seen_names:
-            raise ValueError(f"{path} defines duplicate config name: {name}")
-        seen_names.add(name)
-        for field in ("max_mutators", "max_depth"):
-            if field not in config:
-                raise ValueError(f"{path} config {name} must define {field}")
-    return experiment, {"configs": configs, "synthesize": synthesize}
+    return experiment, {"paths": paths, "synthesize": synthesize}
 
 
 def load_experiments():
@@ -81,14 +67,6 @@ def load_experiments():
 
 
 EXPERIMENTS = load_experiments()
-
-
-def config_names():
-    return sorted({
-        config["name"]
-        for experiment in EXPERIMENTS.values()
-        for config in experiment["configs"]
-    })
 
 
 def load_selected_crates(csv_path):
@@ -281,10 +259,11 @@ def build_tool(skip_build):
     subprocess.run(["cargo", "build", "--bin", "cargo-4safer"], cwd=REPO, check=True)
 
 
-def run_generation(crate, source_dir, source_preprocessing, experiment, config, backends, args):
+def run_generation(crate, source_dir, source_preprocessing, experiment, backends, args):
+    synthesize = EXPERIMENTS[experiment].get("synthesize", {})
     backends = tuple(backends)
     result_paths = {
-        backend: args.out / experiment / config["name"] / backend / crate_key(crate) / "result.json"
+        backend: args.out / experiment / backend / crate_key(crate) / "result.json"
         for backend in backends
     }
     if not args.dry_run and not args.force and all(path.exists() for path in result_paths.values()):
@@ -293,7 +272,7 @@ def run_generation(crate, source_dir, source_preprocessing, experiment, config, 
     multi_backend = len(backends) > 1
     if multi_backend:
         backend_label = "multi-" + "-".join(backends)
-        work_dir = args.out / experiment / config["name"] / backend_label / crate_key(crate)
+        work_dir = args.out / experiment / backend_label / crate_key(crate)
     else:
         work_dir = result_paths[backends[0]].parent
 
@@ -314,26 +293,10 @@ def run_generation(crate, source_dir, source_preprocessing, experiment, config, 
     stdout_path = work_dir / "stdout.log"
     stderr_path = work_dir / "stderr.log"
 
-    max_mutators = args.max_mutators if args.max_mutators is not None else config["max_mutators"]
-    max_depth = args.max_depth if args.max_depth is not None else config["max_depth"]
-    max_sequences = args.max_sequences or 0
-    max_sequences_per_wrapper = (
-        args.max_sequences_per_wrapper
-        if args.max_sequences_per_wrapper is not None
-        else config.get("max_sequences_per_wrapper")
-    )
-    max_sequences_per_target = (
-        args.max_sequences_per_target
-        if args.max_sequences_per_target is not None
-        else config.get("max_sequences_per_target")
-    )
-    max_basic_sequences_per_target = (
-        args.max_basic_sequences_per_target
-        if args.max_basic_sequences_per_target is not None
-        else config.get("max_basic_sequences_per_target")
-    )
-    disable_sequence_limits = bool(args.disable_sequence_limits or config.get("disable_sequence_limits"))
-    sequence_limit_mode = "sequence-unlimited" if disable_sequence_limits else "sequence-limited"
+    configured_cmd_args = configured_synthesize_cmd_args(synthesize)
+    cmd_args_disable_ranking = "--disable-ranking" in configured_cmd_args
+    disable_ranking = bool(args.disable_ranking or cmd_args_disable_ranking)
+    ranking_mode = "generation-order" if disable_ranking else "ranked"
 
     command = [
         str(BIN),
@@ -342,40 +305,41 @@ def run_generation(crate, source_dir, source_preprocessing, experiment, config, 
         str(source_dir),
         "-o",
         str(harness_root),
-        "--max-mutators",
-        str(max_mutators),
-        "--max-depth",
-        str(max_depth),
-        "--max-sequences",
-        str(max_sequences),
         "--timeout",
         str(args.timeout),
         "--log-level",
         args.log_level,
     ]
-    if max_sequences_per_wrapper is not None:
-        command.extend(["--max-sequences-per-wrapper", str(max_sequences_per_wrapper)])
-    if max_sequences_per_target is not None:
-        command.extend(["--max-sequences-per-target", str(max_sequences_per_target)])
-    if max_basic_sequences_per_target is not None:
-        command.extend([
-            "--max-basic-sequences-per-target",
-            str(max_basic_sequences_per_target),
-        ])
+    command.extend(configured_cmd_args)
     for backend in backends:
         command.extend(["--backend", backend])
     if args.check_harness:
         command.append("--check-harness")
-    if config.get("disable_reuse"):
-        command.append("--disable-reuse-penalty")
-    if config.get("disable_depth"):
-        command.append("--disable-depth-penalty")
-    if disable_sequence_limits:
-        command.append("--disable-sequence-limits")
+    if args.max_mutators is not None:
+        command.extend(["--max-mutators", str(args.max_mutators)])
+    if args.max_depth is not None:
+        command.extend(["--max-depth", str(args.max_depth)])
+    if args.max_sequences:
+        command.extend(["--max-sequences", str(args.max_sequences)])
+    if args.max_sequences_per_wrapper is not None:
+        command.extend(["--max-sequences-per-wrapper", str(args.max_sequences_per_wrapper)])
+    if args.max_sequences_per_target is not None:
+        command.extend(["--max-sequences-per-target", str(args.max_sequences_per_target)])
+    if args.floor_sequences_per_target is not None:
+        command.extend(["--floor-sequences-per-target", str(args.floor_sequences_per_target)])
+    if args.r_flow is not None:
+        command.extend(["--r-flow", str(args.r_flow)])
+    if args.w_c is not None:
+        command.extend(["--w-c", str(args.w_c)])
+    if args.w_p is not None:
+        command.extend(["--w-p", str(args.w_p)])
+    if args.disable_ranking and not cmd_args_disable_ranking:
+        command.append("--disable-ranking")
+    synthesis_options = synthesize_option_values(command)
 
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
-    env.update(config.get("env", {}))
+    env.update(synthesize.get("env", {}))
     env.update(parse_env_overrides(args.env))
 
     if args.dry_run:
@@ -386,10 +350,18 @@ def run_generation(crate, source_dir, source_preprocessing, experiment, config, 
                 "version": crate["version"],
                 "note": crate["note"],
                 "experiment": experiment,
-                "config": config["name"],
+                "config": experiment,
                 "backend": backend,
                 "planner": "obligation-driven",
-                "sequence_limit_mode": sequence_limit_mode,
+                "ranking_mode": ranking_mode,
+                "max_mutators": synthesis_options.get("--max-mutators"),
+                "max_depth": synthesis_options.get("--max-depth"),
+                "max_sequences": synthesis_options.get("--max-sequences"),
+                "floor_sequences_per_target": synthesis_options.get("--floor-sequences-per-target"),
+                "r_flow": synthesis_options.get("--r-flow"),
+                "w_c": synthesis_options.get("--w-c"),
+                "w_p": synthesis_options.get("--w-p"),
+                "configured_cmd_args": configured_cmd_args,
                 "status": "dry-run",
                 "command": command,
             }
@@ -427,17 +399,22 @@ def run_generation(crate, source_dir, source_preprocessing, experiment, config, 
             "source": str(source_dir),
             "source_preprocessing": source_preprocessing,
             "experiment": experiment,
-            "config": config["name"],
+            "config": experiment,
             "backend": backend,
             "planner": "obligation-driven",
-            "sequence_limit_mode": sequence_limit_mode,
-            "max_mutators": max_mutators,
-            "max_depth": max_depth,
-            "max_sequences": max_sequences,
-            "disable_sequence_limits": disable_sequence_limits,
-            "disable_reuse": bool(config.get("disable_reuse")),
-            "disable_depth": bool(config.get("disable_depth")),
-            "env": {**config.get("env", {}), **parse_env_overrides(args.env)},
+            "ranking_mode": ranking_mode,
+            "max_mutators": synthesis_options.get("--max-mutators"),
+            "max_depth": synthesis_options.get("--max-depth"),
+            "max_sequences": synthesis_options.get("--max-sequences"),
+            "floor_sequences_per_target": synthesis_options.get("--floor-sequences-per-target"),
+            "r_flow": synthesis_options.get("--r-flow"),
+            "w_c": synthesis_options.get("--w-c"),
+            "w_p": synthesis_options.get("--w-p"),
+            "disable_ranking": disable_ranking,
+            "disable_reuse": "--disable-reuse-penalty" in command,
+            "disable_depth": "--disable-depth-penalty" in command,
+            "configured_cmd_args": configured_cmd_args,
+            "env": {**synthesize.get("env", {}), **parse_env_overrides(args.env)},
             "harness": str(harness),
             "status": status,
             "exit_code": exit_code,
@@ -461,6 +438,39 @@ def parse_env_overrides(values):
         key, env_value = value.split("=", 1)
         overrides[key] = env_value
     return overrides
+
+
+def configured_synthesize_cmd_args(synthesize):
+    value = synthesize.get("cmd_args")
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(arg, str) for arg in value):
+        raise ValueError("synthesize.cmd_args must be a list of strings")
+    return list(value)
+
+
+def synthesize_option_values(argv):
+    value_options = {
+        "--max-mutators",
+        "--max-depth",
+        "--max-sequences",
+        "--max-sequences-per-wrapper",
+        "--max-sequences-per-target",
+        "--floor-sequences-per-target",
+        "--r-flow",
+        "--w-c",
+        "--w-p",
+    }
+    values = {}
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in value_options and index + 1 < len(argv):
+            values[arg] = argv[index + 1]
+            index += 2
+            continue
+        index += 1
+    return values
 
 
 def tail(path, limit=5000):
@@ -623,7 +633,6 @@ def empty_metrics():
         "avg_reuse_penalty": None,
         "target_sequence_cap_total": 0,
         "target_sequences_accepted": 0,
-        "basic_sequence_cap_total": 0,
         "basic_sequences_accepted": 0,
         "sequence_cap_rejected_candidates": 0,
         "mutator_round_raw_candidates": 0,
@@ -717,7 +726,6 @@ def summary_sequence_limit_metrics(summaries):
         "target_sequences_accepted": sum(
             s.get("target_sequences_accepted", 0) for s in summaries
         ),
-        "basic_sequence_cap_total": sum(s.get("basic_sequence_cap", 0) for s in summaries),
         "sequence_cap_rejected_candidates": sum(
             s.get("rejected_candidates_target_sequence_cap", 0)
             + s.get("rejected_candidates_wrapper_sequence_cap", 0)
@@ -783,10 +791,10 @@ def summarize_slices(rows, out_dir):
     rows = [normalize_result(row) for row in rows]
     groups = defaultdict(list)
     for row in rows:
-        groups[(row.get("experiment"), row.get("config"), row.get("backend"))].append(row)
-    for (experiment, config, backend), group in groups.items():
-        if experiment and config and backend:
-            summarize(group, out_dir / experiment / config / backend)
+        groups[(row.get("experiment"), row.get("backend"))].append(row)
+    for (experiment, backend), group in groups.items():
+        if experiment and backend:
+            summarize(group, out_dir / experiment / backend)
 
 
 def summarize_groups(rows):
@@ -929,20 +937,6 @@ def select_crates(all_crates, args):
     return selected
 
 
-def select_configs(experiment, requested_configs):
-    configs = EXPERIMENTS[experiment]["configs"]
-    if not requested_configs:
-        return configs
-    requested = set(requested_configs)
-    selected = [config for config in configs if config["name"] in requested]
-    missing = requested - {config["name"] for config in selected}
-    if missing:
-        raise ValueError(
-            f"{experiment} does not define config(s): {', '.join(sorted(missing))}"
-        )
-    return selected
-
-
 def selected_backends(args):
     requested = args.backend or []
     backends = []
@@ -981,16 +975,44 @@ def shared_synthesize_setting(experiments, key, default=None):
     return first
 
 
+def shared_path_setting(experiments, key, default=None):
+    values = []
+    for experiment in experiments:
+        paths = EXPERIMENTS[experiment].get("paths", {})
+        if key in paths:
+            values.append(paths[key])
+    if not values:
+        return default
+    first = values[0]
+    if any(value != first for value in values[1:]):
+        names = ", ".join(experiments)
+        raise ValueError(f"--{key.replace('_', '-')} must be specified when experiments differ: {names}")
+    return first
+
+
+def shared_path_or_synthesize_setting(experiments, path_key, synthesize_key=None, default=None):
+    value = shared_path_setting(experiments, path_key)
+    if value is not None:
+        return value
+    return shared_synthesize_setting(experiments, synthesize_key or path_key, default)
+
+
 def apply_synthesize_defaults(args, experiments):
     if args.csv is None:
-        args.csv = resolve_repo_path(shared_synthesize_setting(experiments, "csv"), DEFAULT_CSV)
+        args.csv = resolve_repo_path(
+            shared_path_or_synthesize_setting(experiments, "csv"),
+            DEFAULT_CSV,
+        )
     if args.sources_dir is None:
         args.sources_dir = resolve_repo_path(
-            shared_synthesize_setting(experiments, "sources_dir"),
+            shared_path_or_synthesize_setting(experiments, "sources_dir"),
             DEFAULT_SOURCES,
         )
     if args.out is None:
-        args.out = resolve_repo_path(shared_synthesize_setting(experiments, "out"), DEFAULT_OUT)
+        args.out = resolve_repo_path(
+            shared_path_or_synthesize_setting(experiments, "generation_out", "out"),
+            DEFAULT_OUT,
+        )
     if not args.backend:
         configured_backends = shared_synthesize_setting(experiments, "backends", ["tests"])
         if not isinstance(configured_backends, list):
@@ -1008,7 +1030,11 @@ def apply_synthesize_defaults(args, experiments):
 
 def gather_existing_results(out_dir):
     rows = []
-    for path in sorted(out_dir.glob("*/*/*/*/result.json")):
+    paths = {
+        *out_dir.glob("*/*/*/result.json"),
+        *out_dir.glob("*/*/*/*/result.json"),
+    }
+    for path in sorted(paths):
         try:
             rows.append(json.loads(path.read_text()))
         except FileNotFoundError:
@@ -1041,13 +1067,6 @@ def main():
         help="Experiment suite to run. Defaults to obligation-sequence.",
     )
     parser.add_argument(
-        "--config",
-        choices=config_names(),
-        action="append",
-        default=[],
-        help="Run only the named experiment configuration. Repeat to select several.",
-    )
-    parser.add_argument(
         "--backend",
         choices=BACKEND_CHOICES,
         action="append",
@@ -1055,16 +1074,20 @@ def main():
         help="Backend to render. Repeat, pass --backend all, or omit for tests.",
     )
     parser.add_argument(
-        "--disable-sequence-limits",
+        "--disable-ranking",
         action="store_true",
-        help="Force sequence-unlimited obligation-driven generation for selected configs.",
+        dest="disable_ranking",
+        help="Disable heuristic sequence ranking for selected experiments.",
     )
+    parser.add_argument("--r-flow", type=float)
+    parser.add_argument("--w-c", type=float)
+    parser.add_argument("--w-p", type=float)
     parser.add_argument("--max-mutators", type=int)
     parser.add_argument("--max-depth", type=int)
     parser.add_argument("--max-sequences", type=int, default=0)
     parser.add_argument("--max-sequences-per-wrapper", type=int)
     parser.add_argument("--max-sequences-per-target", type=int)
-    parser.add_argument("--max-basic-sequences-per-target", type=int)
+    parser.add_argument("--floor-sequences-per-target", type=int)
     parser.add_argument("--crate", action="append", default=[], help="Crate name or crate-version key.")
     parser.add_argument("--note", action="append", default=[], help="Filter selected_crates.csv by note.")
     parser.add_argument("--limit", type=int)
@@ -1109,15 +1132,7 @@ def main():
         print("no crates selected", file=sys.stderr)
         return 2
 
-    try:
-        experiment_configs = {
-            experiment: select_configs(experiment, args.config) for experiment in experiments
-        }
-    except ValueError as error:
-        print(error, file=sys.stderr)
-        return 2
-
-    total = sum(len(configs) for configs in experiment_configs.values()) * len(selected_crates)
+    total = len(experiments) * len(selected_crates)
     args.backends = selected_backends(args)
     rows = []
     jobs = max(1, args.jobs)
@@ -1127,7 +1142,6 @@ def main():
             crate_rows, completed = run_crate_generations(
                 crate,
                 experiments,
-                experiment_configs,
                 args,
                 completed,
                 total,
@@ -1143,9 +1157,8 @@ def main():
                     run_crate_generations,
                     crate,
                     experiments,
-                    experiment_configs,
                     args,
-                    (index - 1) * sum(len(configs) for configs in experiment_configs.values()),
+                    (index - 1) * len(experiments),
                     total,
                 ): crate
                 for index, crate in enumerate(selected_crates, start=1)
@@ -1170,7 +1183,7 @@ def main():
     return 0
 
 
-def run_crate_generations(crate, experiments, experiment_configs, args, completed, total):
+def run_crate_generations(crate, experiments, args, completed, total):
     rows = []
     try:
         if args.dry_run:
@@ -1184,31 +1197,29 @@ def run_crate_generations(crate, experiments, experiment_configs, args, complete
         return rows, completed
 
     for experiment in experiments:
-        for config in experiment_configs[experiment]:
-            completed += 1
+        completed += 1
+        print(
+            f"[{completed}/{total}] {crate_key(crate)} {experiment} "
+            f"backend={','.join(args.backends)}",
+            flush=True,
+        )
+        try:
+            rows.extend(
+                run_generation(
+                    crate,
+                    source_dir,
+                    source_preprocessing,
+                    experiment,
+                    args.backends,
+                    args,
+                )
+            )
+        except Exception as error:
             print(
-                f"[{completed}/{total}] {crate_key(crate)} {experiment}/{config['name']} "
-                f"backend={','.join(args.backends)}",
+                f"[run-error] {crate_key(crate)} {experiment} {','.join(args.backends)}: {error}",
+                file=sys.stderr,
                 flush=True,
             )
-            try:
-                rows.extend(
-                    run_generation(
-                        crate,
-                        source_dir,
-                        source_preprocessing,
-                        experiment,
-                        config,
-                        args.backends,
-                        args,
-                    )
-                )
-            except Exception as error:
-                print(
-                    f"[run-error] {crate_key(crate)} {config['name']} {','.join(args.backends)}: {error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
     return rows, completed
 
 
