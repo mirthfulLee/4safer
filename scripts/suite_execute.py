@@ -130,7 +130,7 @@ def apply_run_defaults(args, require_backend=True):
         "force",
         "keep_target",
         "prepare_package_tmp",
-        "fuzz_stop_on_crash",
+        "fuzz_stop_on_ub",
         "reuse_fuzz_target_results",
         "build_kani",
         "prepare_kani",
@@ -146,7 +146,7 @@ def default_bool_for_execution_flag(name):
         "force": False,
         "keep_target": False,
         "prepare_package_tmp": True,
-        "fuzz_stop_on_crash": True,
+        "fuzz_stop_on_ub": True,
         "reuse_fuzz_target_results": True,
         "build_kani": False,
         "prepare_kani": True,
@@ -186,8 +186,8 @@ def main():
     parser.add_argument("--fuzz-jobs", type=int, help="Number of fuzz targets to execute in parallel per crate.")
     parser.add_argument("--fuzz-time-limit", type=int, help="Per-fuzz-target AFL -V time limit in seconds; 0 means use --timeout.")
     parser.add_argument("--fuzz-target-timeout", type=int, help="Outer timeout in seconds for each fuzz target command; 0 means AFL -V time plus 600s.")
-    parser.add_argument("--fuzz-stop-on-crash", action="store_true", default=None, help="Stop the current fuzz target early after the first high-confidence UB finding.")
-    parser.add_argument("--no-fuzz-stop-on-crash", dest="fuzz_stop_on_crash", action="store_false")
+    parser.add_argument("--fuzz-stop-on-ub", action="store_true", default=None, help="Stop the current fuzz target early after the first high-confidence UB finding.")
+    parser.add_argument("--no-fuzz-stop-on-ub", dest="fuzz_stop_on_ub", action="store_false")
     parser.add_argument("--reuse-fuzz-target-results", action="store_true", default=None, help="When rerunning with --force, reuse existing non-skipped fuzz target results and only execute missing/skipped targets.")
     parser.add_argument("--no-reuse-fuzz-target-results", dest="reuse_fuzz_target_results", action="store_false")
     parser.add_argument(
@@ -880,7 +880,7 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
         "fuzz_target_timeout_sec": fuzz_outer_timeout(args, fuzz_target_time_limit(args)),
         "fuzz_time_limit_sec": fuzz_target_time_limit(args),
         "fuzz_jobs": args.fuzz_jobs,
-        "fuzz_stop_on_crash": args.fuzz_stop_on_crash,
+        "fuzz_stop_on_ub": args.fuzz_stop_on_ub,
         "fuzz_targets_mode": args.fuzz_targets,
         "fuzz_sanitizer": selected_fuzz_sanitizer(args),
         "fuzz_sanitizer_build_std": bool(
@@ -1048,7 +1048,7 @@ def run_one_fuzz_target(target, harness, env, args, run_dir):
                         timeout=fuzz_outer_timeout(args, fuzz_time_limit),
                         binary=binary,
                         afl_output_dir=afl_output_dir,
-                        stop_on_ub=args.fuzz_stop_on_crash,
+                        stop_on_ub=args.fuzz_stop_on_ub,
                     )
                     fuzz_exit_code = completed.returncode
                     exit_code = fuzz_exit_code

@@ -13,7 +13,7 @@
       "all"
     ],
     "jobs": 4,
-    "timeout": 7200,
+    "timeout": 21600,
     "log_level": "info",
     "cmd_args": [
       "--disable-ranking",
@@ -74,10 +74,10 @@
         "backend": "fuzz",
         "fuzz_sanitizer": "address",
         "fuzz_targets": "all",
-        "fuzz_jobs": 2,
-        "fuzz_time_limit": 86400,
-        "fuzz_target_timeout": 87000,
-        "fuzz_stop_on_crash": true,
+        "fuzz_jobs": 64,
+        "fuzz_time_limit": 6000,
+        "fuzz_target_timeout": 6100,
+        "fuzz_stop_on_ub": true,
         "force": true
       }
     }
