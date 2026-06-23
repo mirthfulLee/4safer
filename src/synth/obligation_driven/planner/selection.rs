@@ -48,9 +48,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         for (_, api_indices) in &mut groups {
             api_indices.sort_unstable();
             api_indices.dedup();
-            if !self.relax_sequence_limit_filters {
-                *api_indices = self.select_representative_targets(api_indices);
-            }
+            *api_indices = self.select_representative_targets(api_indices);
         }
         groups
     }

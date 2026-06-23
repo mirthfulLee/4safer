@@ -30,6 +30,14 @@ pub fn result_wrap(value: Result<u8, bool>) {
     }
 }
 
+pub fn char_wrap(value: char) {
+    unsafe {
+        let mut raw = value as u32;
+        let ptr = &mut raw as *mut u32;
+        *ptr += 1;
+    }
+}
+
 pub fn string_wrap(text: String) {
     unsafe {
         let mut value = text.len() as u32;

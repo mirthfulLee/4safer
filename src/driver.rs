@@ -1,6 +1,6 @@
 use crate::cli::FourSaferArgs;
 use crate::pipeline::run_pipeline;
-use crate::synth::SequenceLimitMode;
+use crate::synth::SequenceRankingMode;
 use crate::workspace::discover_target_for_analysis;
 use anyhow::{Context, Result};
 use log::{debug, info};
@@ -104,11 +104,11 @@ fn print_field_facts_start(cli: &FourSaferArgs) -> Result<()> {
         "starting synthesis:
   crate: {}
   planner: obligation-driven
-  sequence limit mode: {}
+  ranking mode: {}
   backend(s): {}
   output dir: {}",
         target.lib_crate_name,
-        SequenceLimitMode::from_disable_sequence_limits(cli.disable_sequence_limits).as_str(),
+        SequenceRankingMode::from_disable_ranking(cli.disable_ranking).as_str(),
         cli.backend_list_label(),
         harness_dir.display(),
     );

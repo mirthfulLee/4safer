@@ -20,7 +20,7 @@ and generated metadata is written next to the harness crate for validation.
 - The default generated crate is `foursafer_test`.
 - The default backend is `tests`; `kani` and `fuzz` can still be selected with
   `--backend`.
-- Sequence-limit ablation is controlled by `--disable-sequence-limits`.
+- Ranking ablation is controlled by `--disable-ranking`.
 - Metadata is written under `foursafer_meta`.
 
 Contract extraction for unsafe calls and pointer operations remains a
@@ -80,10 +80,10 @@ Build-check the generated harness after synthesis:
 cargo 4safer -C /path/to/crate --check-harness
 ```
 
-Run without wrapper/target sequence caps for ablation:
+Run without heuristic sequence ranking for ablation:
 
 ```bash
-cargo 4safer -C /path/to/crate --disable-sequence-limits
+cargo 4safer -C /path/to/crate --disable-ranking
 ```
 
 Render a non-default backend:
@@ -124,10 +124,13 @@ Common options:
   wrapper group.
 - `--max-sequences-per-target <COUNT>`: max generated sequences per obligation
   target.
-- `--max-basic-sequences-per-target <COUNT>`: max non-mutator-expanded
-  sequences per target.
-- `--disable-sequence-limits`: remove wrapper/target/basic sequence caps for
-  ablation.
+- `--floor-sequences-per-target <COUNT>`: sequence budget for
+  one target with multiple obligated parameters; default `16`.
+- `--disable-ranking`: accept generated sequences in construction order while
+  keeping the same sequence budgets.
+- `--r-flow <VALUE>`: flow decay ratio in sequence ranking; default `0.5`.
+- `--w-c <VALUE>`: construction-cost weight in sequence ranking; default `0.1`.
+- `--w-p <VALUE>`: diversity-penalty weight in sequence ranking; default `0.2`.
 - `--disable-reuse-penalty`: disable mutator reuse penalty for ablation.
 - `--disable-depth-penalty`: disable depth saturation and stagnation penalties
   for ablation.

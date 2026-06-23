@@ -36,10 +36,9 @@ const MAX_CALL_PLAN_CANDIDATES: usize = 128;
 const MAX_COMBINED_PREFIXES: usize = 32;
 const MAX_MUTATOR_CANDIDATES_PER_PARAM: usize = 16;
 const ALLOW_REQUIRED_PROVIDED_OVERLAP: bool = true;
-const CONSTRUCTION_COST_WEIGHT: f32 = 1.0;
-const PREFIX_DISTANCE_WEIGHT: f32 = 1.0;
-const TARGET_DISTANCE_WEIGHT: f32 = 1.0;
-const REUSE_PENALTY_WEIGHT: f32 = 1.0;
+const R_FLOW: f32 = 0.5;
+const COST_WEIGHT: f32 = 0.1;
+const DIVERSITY_PENALTY_WEIGHT: f32 = 0.2;
 const DEPTH_SATURATION_WEIGHT: f32 = 0.25;
 const STAGNATION_SEQUENCE_THRESHOLD: f32 = 0.5;
 const STAGNATION_DEPTH_WEIGHT: f32 = 0.5;
@@ -48,7 +47,7 @@ const STAGNATION_DEPTH_WEIGHT: f32 = 0.5;
 struct PlannerCaps {
     mono_targets_per_generic_function: usize,
     targets_per_shape: usize,
-    multi_obligated_param_sequences_per_target: usize,
+    floor_sequences_per_target: usize,
 }
 
 impl Default for PlannerCaps {
@@ -56,8 +55,7 @@ impl Default for PlannerCaps {
         Self {
             mono_targets_per_generic_function: DEFAULT_MONO_TARGETS_PER_GENERIC_FUNCTION,
             targets_per_shape: DEFAULT_TARGETS_PER_SHAPE,
-            multi_obligated_param_sequences_per_target:
-                DEFAULT_MULTI_OBLIGATED_PARAM_SEQUENCES_PER_TARGET,
+            floor_sequences_per_target: DEFAULT_MULTI_OBLIGATED_PARAM_SEQUENCES_PER_TARGET,
         }
     }
 }
@@ -75,11 +73,9 @@ struct PlannerTuning {
     mutation_round1_limit: usize,
     mutation_round2_limit: usize,
     mutation_round3_limit: usize,
-    construction_cost_weight: f32,
-    prefix_distance_weight: f32,
-    target_distance_weight: f32,
-    reuse_penalty_weight: f32,
-    depth_penalty_weight: f32,
+    r_flow: f32,
+    cost_weight: f32,
+    diversity_penalty_weight: f32,
     depth_saturation_weight: f32,
     stagnation_sequence_threshold: f32,
     stagnation_depth_weight: f32,
@@ -100,11 +96,9 @@ impl Default for PlannerTuning {
             mutation_round1_limit: 8,
             mutation_round2_limit: 4,
             mutation_round3_limit: 2,
-            construction_cost_weight: CONSTRUCTION_COST_WEIGHT,
-            prefix_distance_weight: PREFIX_DISTANCE_WEIGHT,
-            target_distance_weight: TARGET_DISTANCE_WEIGHT,
-            reuse_penalty_weight: REUSE_PENALTY_WEIGHT,
-            depth_penalty_weight: 0.25,
+            r_flow: R_FLOW,
+            cost_weight: COST_WEIGHT,
+            diversity_penalty_weight: DIVERSITY_PENALTY_WEIGHT,
             depth_saturation_weight: DEPTH_SATURATION_WEIGHT,
             stagnation_sequence_threshold: STAGNATION_SEQUENCE_THRESHOLD,
             stagnation_depth_weight: STAGNATION_DEPTH_WEIGHT,
@@ -113,21 +107,18 @@ impl Default for PlannerTuning {
 }
 
 impl PlannerCaps {
-    fn from_env() -> Self {
+    fn from_config(floor_sequences_per_target: usize) -> Self {
         let defaults = Self::default();
         Self {
             mono_targets_per_generic_function: defaults.mono_targets_per_generic_function,
             targets_per_shape: defaults.targets_per_shape,
-            multi_obligated_param_sequences_per_target: env_usize(
-                "FOURSAFER_OD_MULTI_OBLIGATED_PARAM_SEQUENCES_PER_TARGET",
-                defaults.multi_obligated_param_sequences_per_target,
-            ),
+            floor_sequences_per_target,
         }
     }
 }
 
 impl PlannerTuning {
-    fn from_env() -> Self {
+    fn from_config(r_flow: f32, cost_weight: f32, diversity_penalty_weight: f32) -> Self {
         let defaults = Self::default();
         Self {
             top_k_candidates: defaults.top_k_candidates,
@@ -145,38 +136,12 @@ impl PlannerTuning {
             mutation_round1_limit: defaults.mutation_round1_limit,
             mutation_round2_limit: defaults.mutation_round2_limit,
             mutation_round3_limit: defaults.mutation_round3_limit,
-            construction_cost_weight: env_f32(
-                "FOURSAFER_OD_CONSTRUCTION_COST_WEIGHT",
-                defaults.construction_cost_weight,
-            ),
-            prefix_distance_weight: env_f32(
-                "FOURSAFER_OD_PREFIX_DISTANCE_WEIGHT",
-                defaults.prefix_distance_weight,
-            ),
-            target_distance_weight: env_f32(
-                "FOURSAFER_OD_TARGET_DISTANCE_WEIGHT",
-                defaults.target_distance_weight,
-            ),
-            reuse_penalty_weight: env_f32(
-                "FOURSAFER_OD_REUSE_PENALTY_WEIGHT",
-                defaults.reuse_penalty_weight,
-            ),
-            depth_penalty_weight: env_f32(
-                "FOURSAFER_OD_DEPTH_PENALTY_WEIGHT",
-                defaults.depth_penalty_weight,
-            ),
-            depth_saturation_weight: env_f32(
-                "FOURSAFER_OD_DEPTH_SATURATION_WEIGHT",
-                defaults.depth_saturation_weight,
-            ),
-            stagnation_sequence_threshold: env_f32(
-                "FOURSAFER_OD_STAGNATION_SEQUENCE_THRESHOLD",
-                defaults.stagnation_sequence_threshold,
-            ),
-            stagnation_depth_weight: env_f32(
-                "FOURSAFER_OD_STAGNATION_DEPTH_WEIGHT",
-                defaults.stagnation_depth_weight,
-            ),
+            r_flow,
+            cost_weight,
+            diversity_penalty_weight,
+            depth_saturation_weight: defaults.depth_saturation_weight,
+            stagnation_sequence_threshold: defaults.stagnation_sequence_threshold,
+            stagnation_depth_weight: defaults.stagnation_depth_weight,
         }
     }
 }
@@ -186,15 +151,6 @@ fn env_usize(name: &str, default: usize) -> usize {
         Ok(value) => value
             .parse::<usize>()
             .unwrap_or_else(|error| panic!("{name} must be usize, got `{value}`: {error}")),
-        Err(_) => default,
-    }
-}
-
-fn env_f32(name: &str, default: f32) -> f32 {
-    match env::var(name) {
-        Ok(value) => value
-            .parse::<f32>()
-            .unwrap_or_else(|error| panic!("{name} must be f32, got `{value}`: {error}")),
         Err(_) => default,
     }
 }
@@ -216,12 +172,12 @@ pub(crate) struct Planner<'tcx, 'a> {
     max_sequences: usize,
     max_sequences_per_wrapper: usize,
     max_sequences_per_target: usize,
-    max_basic_sequences_per_target: usize,
+    wrapper_target_max_distance: f32,
     reuse_penalty_enabled: bool,
     depth_penalty_enabled: bool,
+    ranking_enabled: bool,
     caps: PlannerCaps,
     tuning: PlannerTuning,
-    relax_sequence_limit_filters: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -233,7 +189,6 @@ struct ObligatedParamCandidatePath {
 #[derive(Clone, Debug)]
 struct MultiObligatedParamCandidatePath {
     obligated_params: Vec<ObligatedParamCandidatePath>,
-    mutator_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -288,9 +243,14 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         max_sequences: usize,
         max_sequences_per_wrapper: usize,
         max_sequences_per_target: usize,
-        max_basic_sequences_per_target: usize,
+        floor_sequences_per_target: usize,
+        wrapper_target_max_distance: f32,
+        r_flow: f32,
+        cost_weight: f32,
+        diversity_penalty_weight: f32,
         reuse_penalty_enabled: bool,
         depth_penalty_enabled: bool,
+        ranking_enabled: bool,
     ) -> Self {
         let apis = build_api_descriptors(tcx, graph, field_facts_index);
         let mut constructors: HashMap<TyWrapper<'tcx>, Vec<usize>> = HashMap::new();
@@ -344,12 +304,12 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             max_sequences,
             max_sequences_per_wrapper,
             max_sequences_per_target,
-            max_basic_sequences_per_target,
+            wrapper_target_max_distance,
             reuse_penalty_enabled,
             depth_penalty_enabled,
-            caps: PlannerCaps::from_env(),
-            tuning: PlannerTuning::from_env(),
-            relax_sequence_limit_filters: false,
+            ranking_enabled,
+            caps: PlannerCaps::from_config(floor_sequences_per_target),
+            tuning: PlannerTuning::from_config(r_flow, cost_weight, diversity_penalty_weight),
         }
     }
 
@@ -389,43 +349,22 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         }
     }
 
-    pub(crate) fn synthesize_unlimited(mut self) -> SynthesizedSuite<'tcx> {
-        self.relax_sequence_limit_filters = true;
-        let target_groups = self.select_target_function_groups(self.collect_obligation_targets());
-        info!(
-            target: "foursafer::planner",
-            "obligation-driven unlimited planner: {} unsafe wrappers after relaxed target selection",
-            target_groups.len()
-        );
-
-        let mut sequences = Vec::new();
-        let mut target_summaries = Vec::new();
-        for (unsafe_wrapper, target_group) in target_groups {
-            if self.sequence_limit_reached(sequences.len()) {
+    fn cap_and_sort_suite_sequences(&self, sequences: &mut Vec<SequencePlan>) {
+        if !self.ranking_enabled {
+            if self.max_sequences != 0 && sequences.len() > self.max_sequences {
+                let uncapped_len = sequences.len();
+                truncate_sequence_plans_preserving_order(sequences, self.max_sequences);
                 info!(
                     target: "foursafer::planner",
-                    "global suite sequence cap reached; skipping remaining target groups"
+                    "global suite sequence cap retained {} of {} sequences (limit={})",
+                    sequences.len(),
+                    uncapped_len,
+                    self.max_sequences
                 );
-                break;
             }
-            self.synthesize_target_group_unlimited(
-                &unsafe_wrapper,
-                &target_group,
-                &mut sequences,
-                &mut target_summaries,
-            );
+            return;
         }
 
-        self.cap_and_sort_suite_sequences(&mut sequences);
-
-        SynthesizedSuite {
-            apis: self.apis,
-            sequences,
-            target_summaries,
-        }
-    }
-
-    fn cap_and_sort_suite_sequences(&self, sequences: &mut Vec<SequencePlan>) {
         if self.max_sequences == 0 {
             sort_sequence_plans_preserving_links(sequences);
             return;

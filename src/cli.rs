@@ -46,7 +46,7 @@ struct FlagCli {
     four_safer: FourSaferArgs,
 }
 
-#[derive(Args, Debug, Clone, PartialEq, Eq)]
+#[derive(Args, Debug, Clone, PartialEq)]
 pub struct FourSaferArgs {
     /// Output directory for the generated harness crate.
     #[arg(
@@ -138,34 +138,70 @@ pub struct FourSaferArgs {
         display_order = 18
     )]
     pub max_sequences_per_target: usize,
-    /// Maximum basic, non-mutator-expanded sequences per target; 0 means unlimited.
+    /// Floor sequence budget for one target with multiple obligated parameters.
     #[arg(
-        long = "max-basic-sequences-per-target",
+        long = "floor-sequences-per-target",
         value_name = "COUNT",
-        default_value_t = 32,
+        default_value_t = 16,
         help_heading = "Core Options",
         display_order = 19
     )]
-    pub max_basic_sequences_per_target: usize,
-    /// Disable wrapper/target sequence limits for ablation runs.
+    pub floor_sequences_per_target: usize,
+    /// Maximum call distance used to weight per-target wrapper budget allocation.
     #[arg(
-        long = "disable-sequence-limits",
+        long = "wrapper-target-max-distance",
+        value_name = "DISTANCE",
+        default_value_t = 4.0,
         help_heading = "Core Options",
         display_order = 20
     )]
-    pub disable_sequence_limits: bool,
+    pub wrapper_target_max_distance: f32,
+    /// Disable heuristic sequence ranking and accept candidates in generation order.
+    #[arg(
+        long = "disable-ranking",
+        help_heading = "Core Options",
+        display_order = 21
+    )]
+    pub disable_ranking: bool,
+    /// Flow decay ratio used by heuristic sequence ranking.
+    #[arg(
+        long = "r-flow",
+        value_name = "VALUE",
+        default_value_t = 0.5,
+        help_heading = "Core Options",
+        display_order = 22
+    )]
+    pub r_flow: f32,
+    /// Construction-cost weight used by heuristic sequence ranking.
+    #[arg(
+        long = "w-c",
+        value_name = "VALUE",
+        default_value_t = 0.1,
+        help_heading = "Core Options",
+        display_order = 22
+    )]
+    pub w_c: f32,
+    /// Diversity-penalty weight used by heuristic sequence ranking.
+    #[arg(
+        long = "w-p",
+        value_name = "VALUE",
+        default_value_t = 0.2,
+        help_heading = "Core Options",
+        display_order = 23
+    )]
+    pub w_p: f32,
     /// Disable mutator reuse penalty when ordering obligation-driven actions.
     #[arg(
         long = "disable-reuse-penalty",
         help_heading = "Core Options",
-        display_order = 21
+        display_order = 24
     )]
     pub disable_reuse_penalty: bool,
     /// Disable depth saturation penalties for ablation runs.
     #[arg(
         long = "disable-depth-penalty",
         help_heading = "Core Options",
-        display_order = 22
+        display_order = 25
     )]
     pub disable_depth_penalty: bool,
     /// Application log verbosity for 4safer stages.
@@ -174,7 +210,7 @@ pub struct FourSaferArgs {
         value_enum,
         default_value_t = LogLevel::Info,
         help_heading = "Core Options",
-        display_order = 23
+        display_order = 26
     )]
     pub log_level: LogLevel,
     /// Crate dir. Defaults to the current directory.
@@ -318,11 +354,19 @@ impl FourSaferArgs {
         args.push(self.max_sequences_per_wrapper.to_string());
         args.push("--max-sequences-per-target".to_owned());
         args.push(self.max_sequences_per_target.to_string());
-        args.push("--max-basic-sequences-per-target".to_owned());
-        args.push(self.max_basic_sequences_per_target.to_string());
-        if self.disable_sequence_limits {
-            args.push("--disable-sequence-limits".to_owned());
+        args.push("--floor-sequences-per-target".to_owned());
+        args.push(self.floor_sequences_per_target.to_string());
+        args.push("--wrapper-target-max-distance".to_owned());
+        args.push(self.wrapper_target_max_distance.to_string());
+        if self.disable_ranking {
+            args.push("--disable-ranking".to_owned());
         }
+        args.push("--r-flow".to_owned());
+        args.push(self.r_flow.to_string());
+        args.push("--w-c".to_owned());
+        args.push(self.w_c.to_string());
+        args.push("--w-p".to_owned());
+        args.push(self.w_p.to_string());
         if self.disable_reuse_penalty {
             args.push("--disable-reuse-penalty".to_owned());
         }
@@ -359,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_tests_backend_and_sequence_limited_obligation_planning() {
+    fn defaults_to_tests_backend_and_ranked_obligation_planning() {
         let cli = FourSaferArgs::parse_flag_args(["4safer"]).expect("defaults should parse");
 
         assert_eq!(cli.harness_crate, PathBuf::from("foursafer_test"));
@@ -369,14 +413,18 @@ mod tests {
         assert_eq!(cli.max_sequences, 0);
         assert_eq!(cli.max_sequences_per_wrapper, 1024);
         assert_eq!(cli.max_sequences_per_target, 128);
-        assert_eq!(cli.max_basic_sequences_per_target, 32);
-        assert!(!cli.disable_sequence_limits);
+        assert_eq!(cli.floor_sequences_per_target, 16);
+        assert_eq!(cli.wrapper_target_max_distance, 4.0);
+        assert!(!cli.disable_ranking);
+        assert_eq!(cli.r_flow, 0.5);
+        assert_eq!(cli.w_c, 0.1);
+        assert_eq!(cli.w_p, 0.2);
         assert!(!cli.check_harness);
         assert_eq!(cli.log_level, LogLevel::Info);
     }
 
     #[test]
-    fn parse_flag_args_accepts_common_options_and_limit_ablation() {
+    fn parse_flag_args_accepts_common_options_and_ranking_ablation() {
         let cli = FourSaferArgs::parse_flag_args([
             "4safer",
             "-C",
@@ -394,11 +442,19 @@ mod tests {
             "1024",
             "--max-sequences-per-target",
             "128",
-            "--max-basic-sequences-per-target",
-            "16",
+            "--floor-sequences-per-target",
+            "12",
+            "--wrapper-target-max-distance",
+            "6.5",
             "-t",
             "30",
-            "--disable-sequence-limits",
+            "--disable-ranking",
+            "--r-flow",
+            "0.75",
+            "--w-c",
+            "0.25",
+            "--w-p",
+            "0.5",
             "--disable-reuse-penalty",
             "--disable-depth-penalty",
         ])
@@ -412,11 +468,29 @@ mod tests {
         assert_eq!(cli.max_sequences, 32768);
         assert_eq!(cli.max_sequences_per_wrapper, 1024);
         assert_eq!(cli.max_sequences_per_target, 128);
-        assert_eq!(cli.max_basic_sequences_per_target, 16);
+        assert_eq!(cli.floor_sequences_per_target, 12);
+        assert_eq!(cli.wrapper_target_max_distance, 6.5);
         assert_eq!(cli.timeout, Some(30));
-        assert!(cli.disable_sequence_limits);
+        assert!(cli.disable_ranking);
+        assert_eq!(cli.r_flow, 0.75);
+        assert_eq!(cli.w_c, 0.25);
+        assert_eq!(cli.w_p, 0.5);
         assert!(cli.disable_reuse_penalty);
         assert!(cli.disable_depth_penalty);
+    }
+
+    #[test]
+    fn parse_flag_args_rejects_removed_ranking_ablation_aliases() {
+        for removed_flag in [
+            "--disable-sequence-limits",
+            "--disable-budget-limit",
+            "--unbudgeted",
+        ] {
+            assert!(
+                FourSaferArgs::parse_flag_args(["4safer", removed_flag]).is_err(),
+                "{removed_flag} should not remain as a compatibility alias"
+            );
+        }
     }
 
     #[test]
@@ -437,8 +511,12 @@ mod tests {
             max_sequences: 32768,
             max_sequences_per_wrapper: 1024,
             max_sequences_per_target: 128,
-            max_basic_sequences_per_target: 16,
-            disable_sequence_limits: true,
+            floor_sequences_per_target: 12,
+            wrapper_target_max_distance: 6.5,
+            disable_ranking: true,
+            r_flow: 0.75,
+            w_c: 0.25,
+            w_p: 0.5,
             disable_reuse_penalty: true,
             disable_depth_penalty: true,
             log_level: LogLevel::Debug,
@@ -469,8 +547,12 @@ mod tests {
             max_sequences: 0,
             max_sequences_per_wrapper: 1024,
             max_sequences_per_target: 128,
-            max_basic_sequences_per_target: 32,
-            disable_sequence_limits: false,
+            floor_sequences_per_target: 16,
+            wrapper_target_max_distance: 4.0,
+            disable_ranking: false,
+            r_flow: 0.5,
+            w_c: 0.1,
+            w_p: 0.2,
             disable_reuse_penalty: false,
             disable_depth_penalty: false,
             log_level: LogLevel::Info,
@@ -517,8 +599,12 @@ mod tests {
             max_sequences: 0,
             max_sequences_per_wrapper: 1024,
             max_sequences_per_target: 128,
-            max_basic_sequences_per_target: 32,
-            disable_sequence_limits: false,
+            floor_sequences_per_target: 16,
+            wrapper_target_max_distance: 4.0,
+            disable_ranking: false,
+            r_flow: 0.5,
+            w_c: 0.1,
+            w_p: 0.2,
             disable_reuse_penalty: false,
             disable_depth_penalty: false,
             log_level: LogLevel::Info,

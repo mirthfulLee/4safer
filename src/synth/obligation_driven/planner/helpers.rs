@@ -21,7 +21,6 @@ pub(super) fn basic_target_candidate(
                 remaining_needed: initial_target_obligations(&apis[target_api], *param_index),
             })
             .collect(),
-        mutator_count: 0,
     }
 }
 
@@ -622,32 +621,6 @@ pub(super) fn rank_sequence_candidates(
     candidates.sort_by(|left, right| compare_sequence_candidates(left, right, tuning));
 }
 
-pub(super) fn rank_and_truncate_sequence_candidates(
-    mut candidates: Vec<SequenceCandidate>,
-    limit: usize,
-    tuning: &PlannerTuning,
-) -> Vec<SequenceCandidate> {
-    if candidates.len() <= limit {
-        return candidates;
-    }
-
-    rank_sequence_candidates(&mut candidates, tuning);
-    candidates.truncate(limit);
-    candidates
-}
-
-pub(super) fn pop_next_unlimited_candidate(
-    candidates: &mut Vec<SequenceCandidate>,
-    tuning: &PlannerTuning,
-) -> Option<SequenceCandidate> {
-    let best_index = candidates
-        .iter()
-        .enumerate()
-        .min_by(|(_, left), (_, right)| compare_sequence_candidates(left, right, tuning))
-        .map(|(index, _)| index)?;
-    Some(candidates.remove(best_index))
-}
-
 fn compare_sequence_candidates(
     left: &SequenceCandidate,
     right: &SequenceCandidate,
@@ -657,9 +630,10 @@ fn compare_sequence_candidates(
         .partial_cmp(&base_candidate_priority(right, tuning))
         .unwrap()
         .then(
-            left.sequence
+            right
+                .sequence
                 .ranking_value
-                .partial_cmp(&right.sequence.ranking_value)
+                .partial_cmp(&left.sequence.ranking_value)
                 .unwrap(),
         )
         .then(left.expansion_depth.cmp(&right.expansion_depth))
@@ -679,32 +653,52 @@ pub(super) fn base_candidate_priority(
     candidate: &SequenceCandidate,
     tuning: &PlannerTuning,
 ) -> f32 {
-    tuning.construction_cost_weight * candidate.construction_cost
-        + tuning.prefix_distance_weight * candidate.prefix_distance
-        + tuning.target_distance_weight * candidate.target_to_wrapper_distance
+    tuning.cost_weight * candidate.construction_cost - candidate_flow_score(candidate, tuning)
 }
 
 pub(super) fn evaluate_candidate(
     candidate: &SequenceCandidate,
-    reuse_penalty: f32,
+    diversity_penalty: f32,
     ordering_penalty: f32,
     tuning: &PlannerTuning,
 ) -> CandidateEvaluation {
-    let total_distance = tuning.prefix_distance_weight * candidate.prefix_distance
-        + tuning.target_distance_weight * candidate.target_to_wrapper_distance;
-    let depth_penalty = tuning.depth_penalty_weight * candidate.expansion_depth as f32;
+    let total_distance = candidate.prefix_distance + candidate.target_to_wrapper_distance;
+    let flow_score = candidate_flow_score(candidate, tuning);
+    let total_diversity_penalty = diversity_penalty + ordering_penalty;
+    let priority_score = flow_score
+        - tuning.cost_weight * candidate.construction_cost
+        - tuning.diversity_penalty_weight * total_diversity_penalty;
     CandidateEvaluation {
         construction_cost: candidate.construction_cost,
         prefix_distance: candidate.prefix_distance,
         target_to_wrapper_distance: candidate.target_to_wrapper_distance,
         total_distance,
-        reuse_penalty,
-        queue_priority: tuning.construction_cost_weight * candidate.construction_cost
-            + total_distance
-            + tuning.reuse_penalty_weight * reuse_penalty
-            + depth_penalty
-            + ordering_penalty,
+        priority_score,
+        reuse_penalty: total_diversity_penalty,
+        queue_priority: -priority_score,
     }
+}
+
+pub(super) fn candidate_flow_score(candidate: &SequenceCandidate, tuning: &PlannerTuning) -> f32 {
+    flow_score_for_parts(
+        candidate.sequence.selected_obligation_fields.len(),
+        candidate.prefix_distance,
+        candidate.target_to_wrapper_distance,
+        tuning,
+    )
+}
+
+pub(super) fn flow_score_for_parts(
+    propagated_fields: usize,
+    prefix_distance: f32,
+    target_distance: f32,
+    tuning: &PlannerTuning,
+) -> f32 {
+    if propagated_fields == 0 {
+        return 0.0;
+    }
+    let distance = prefix_distance + target_distance;
+    propagated_fields as f32 * tuning.r_flow.powf(distance.max(0.0))
 }
 
 pub(super) fn distance_to_selected_obligation_site(
@@ -732,16 +726,20 @@ pub(super) fn mutator_candidate_rank_key(
     call_distance: u32,
     target_distance: f32,
     tuning: &PlannerTuning,
-) -> (u32, i32, usize, usize) {
+) -> (i32, i32, usize, usize) {
     let prefix_distance = call_distance.saturating_add(1) as f32;
-    let total_distance = tuning.prefix_distance_weight * prefix_distance
-        + tuning.target_distance_weight * target_distance;
-    let queue_priority = tuning.construction_cost_weight + total_distance;
     let overlap = obligation_overlap_count(provided, obligation) as i32;
+    let flow_score = flow_score_for_parts(
+        overlap.max(0) as usize,
+        prefix_distance,
+        target_distance,
+        tuning,
+    );
+    let queue_priority = tuning.cost_weight - flow_score;
     let provided_width = provided.len();
 
     (
-        queue_priority.ceil() as u32,
+        (queue_priority * 1000.0).round() as i32,
         -overlap,
         provided_width,
         mutator_api,
@@ -990,9 +988,9 @@ pub(super) fn cap_sequence_plans_preserving_predecessors(
 
     let mut ranked = (0..sequences.len()).collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
-        sequences[*left]
+        sequences[*right]
             .ranking_value
-            .partial_cmp(&sequences[*right].ranking_value)
+            .partial_cmp(&sequences[*left].ranking_value)
             .unwrap()
             .then(
                 usize::from(sequences[*left].predecessor.is_some())
@@ -1076,12 +1074,31 @@ pub(super) fn cap_sequence_plans_preserving_predecessors(
     index_map
 }
 
+pub(super) fn truncate_sequence_plans_preserving_order(
+    sequences: &mut Vec<SequencePlan>,
+    limit: usize,
+) {
+    if sequences.len() <= limit {
+        return;
+    }
+    sequences.truncate(limit);
+    for sequence in sequences {
+        if sequence
+            .predecessor
+            .is_some_and(|predecessor| predecessor >= limit)
+        {
+            sequence.predecessor = None;
+        }
+        sequence.successor.retain(|successor| *successor < limit);
+    }
+}
+
 pub(super) fn sort_sequence_plans_preserving_links(sequences: &mut Vec<SequencePlan>) {
     let mut ranked = (0..sequences.len()).collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
-        sequences[*left]
+        sequences[*right]
             .ranking_value
-            .partial_cmp(&sequences[*right].ranking_value)
+            .partial_cmp(&sequences[*left].ranking_value)
             .unwrap()
             .then(
                 sequences[*left]
@@ -1153,7 +1170,10 @@ pub(super) fn extend_available_ty_variants<'tcx>(
 
 #[cfg(test)]
 mod tests {
-    use super::{earliest_mutator_insertion_index, required_fields_before_call};
+    use super::{
+        earliest_mutator_insertion_index, required_fields_before_call,
+        truncate_sequence_plans_preserving_order,
+    };
     use crate::synth::{CallStep, SequencePlan};
     use crate::unsafe_analysis::FieldSet;
 
@@ -1251,5 +1271,46 @@ mod tests {
         let provided = FieldSet::from([vec![0]]);
 
         assert!(required_fields_before_call(&current_needed, &provided, false).is_empty());
+    }
+
+    #[test]
+    fn order_truncation_drops_links_to_removed_sequences() {
+        let mut sequences = vec![
+            test_sequence(0, None),
+            test_sequence(1, Some(2)),
+            test_sequence(2, None),
+        ];
+        sequences[0].successor = vec![1, 2];
+        sequences[1].successor = vec![2];
+
+        truncate_sequence_plans_preserving_order(&mut sequences, 2);
+
+        assert_eq!(sequences.len(), 2);
+        assert_eq!(sequences[0].successor, vec![1]);
+        assert_eq!(sequences[1].predecessor, None);
+        assert!(sequences[1].successor.is_empty());
+    }
+
+    fn test_sequence(target_api: usize, predecessor: Option<usize>) -> SequencePlan {
+        SequencePlan {
+            steps: Vec::new(),
+            target_api,
+            unsafe_wrapper: String::new(),
+            target_step: 0,
+            predecessor,
+            successor: Vec::new(),
+            latest_call: 0,
+            mutated_param: None,
+            selected_obligation_call: None,
+            selected_obligation_param: None,
+            selected_obligation_fields: FieldSet::new(),
+            ranking_value: 0.0,
+            construction_cost: 0.0,
+            prefix_distance: 0.0,
+            target_to_wrapper_distance: 0.0,
+            total_distance: 0.0,
+            reuse_penalty: 0.0,
+            queue_priority: 0.0,
+        }
     }
 }

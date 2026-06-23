@@ -22,10 +22,18 @@ fn cargo_4safer_help_lists_common_flags() {
     assert!(stdout.contains("--max-sequences <COUNT>"));
     assert!(stdout.contains("--max-sequences-per-wrapper <COUNT>"));
     assert!(stdout.contains("--max-sequences-per-target <COUNT>"));
-    assert!(stdout.contains("--max-basic-sequences-per-target <COUNT>"));
-    assert!(stdout.contains("--disable-sequence-limits"));
+    assert!(stdout.contains("--floor-sequences-per-target <COUNT>"));
+    assert!(stdout.contains("--wrapper-target-max-distance <DISTANCE>"));
+    assert!(stdout.contains("--disable-ranking"));
+    assert!(stdout.contains("--r-flow <VALUE>"));
+    assert!(stdout.contains("--w-c <VALUE>"));
+    assert!(stdout.contains("--w-p <VALUE>"));
     assert!(stdout.contains("--disable-reuse-penalty"));
     assert!(stdout.contains("--disable-depth-penalty"));
+    assert!(!stdout.contains("--disable-sequence-limits"));
+    assert!(!stdout.contains("--disable-budget-limit"));
+    assert!(!stdout.contains("--unbudgeted"));
+    assert!(!stdout.contains("--max-basic-sequences-per-target"));
     assert!(!stdout.contains("--strategy"));
     assert!(!stdout.contains("unsafe-wrapper"));
 }
@@ -87,19 +95,37 @@ fn cargo_4safer_limits_default_planner_by_wrapper_sequence_count() {
 }
 
 #[test]
-fn cargo_4safer_accepts_limit_ablation_flag() {
+fn cargo_4safer_accepts_ranking_ablation_flag() {
     let run = run_4safer_on_fixture(
         "unsafe-wrapper-indirect-field-lib",
-        "unlimited-harness",
+        "ranking-ablation-harness",
         true,
-        &["--disable-sequence-limits"],
+        &["--disable-ranking"],
     );
     run.assert_success();
 
     let sequence_metadata = run.sequence_metadata("unsafe_wrapper_indirect_field_lib");
     assert!(
         !sequence_metadata.is_empty(),
-        "expected unlimited obligation-driven synthesis to emit sequences"
+        "expected ranking-ablation synthesis to emit sequences"
+    );
+}
+
+#[test]
+fn cargo_4safer_ranking_ablation_keeps_sequence_caps() {
+    let run = run_4safer_on_fixture(
+        "unsafe-wrapper-indirect-field-lib",
+        "ranking-ablation-capped-harness",
+        true,
+        &["--disable-ranking", "--max-sequences-per-wrapper", "1"],
+    );
+    run.assert_success();
+
+    let sequence_metadata = run.sequence_metadata("unsafe_wrapper_indirect_field_lib");
+    assert_eq!(
+        sequence_metadata.len(),
+        1,
+        "ranking ablation should preserve wrapper sequence caps"
     );
 }
 
@@ -148,6 +174,37 @@ fn cargo_4safer_fuzz_backend_treats_fallible_outputs_as_discarded_inputs() {
                 && target.contains("::std::panic::AssertUnwindSafe")
         }),
         "expected fuzz targets to keep target panics from aborting AFL seed validation"
+    );
+}
+
+#[test]
+fn cargo_4safer_tests_backend_includes_non_ascii_literal_seeds() {
+    let run = run_4safer_on_fixture(
+        "unsafe-wrapper-symbolic-std-lib",
+        "symbolic-std-literal-seeds-harness",
+        true,
+        &["--max-sequences", "0"],
+    );
+    run.assert_success();
+
+    let generated_sources = fs::read_dir(run.harness_dir.join("src"))
+        .expect("generated src directory should exist")
+        .map(|entry| {
+            let path = entry
+                .expect("generated source entry should be readable")
+                .path();
+            fs::read_to_string(path).expect("generated source should be readable")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        generated_sources.contains("'🦀'"),
+        "expected char literal seeds to include a non-ASCII emoji:\n{generated_sources}"
+    );
+    assert!(
+        generated_sources.contains("[240u8, 159u8, 166u8, 128u8, 0u8, 0u8, 0u8, 0u8], 4usize"),
+        "expected string-like literal seeds to include an emoji UTF-8 byte sequence:\n{generated_sources}"
     );
 }
 

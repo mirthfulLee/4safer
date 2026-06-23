@@ -664,6 +664,10 @@ impl<'tcx, 'graph> AdapterContext<'tcx, 'graph> {
                     "[97u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8]".to_owned(),
                     "1usize".to_owned(),
                 ]),
+                format_tuple_expr(&[
+                    "[240u8, 159u8, 166u8, 128u8, 0u8, 0u8, 0u8, 0u8]".to_owned(),
+                    "4usize".to_owned(),
+                ]),
                 format!("([65u8; {SYMBOLIC_COLLECTION_LEN}], {SYMBOLIC_COLLECTION_LEN}usize)"),
             ]);
         }
@@ -749,7 +753,12 @@ impl<'tcx, 'graph> AdapterContext<'tcx, 'graph> {
 
         match value_ty.kind() {
             TyKind::Bool => Some(vec!["false".to_owned(), "true".to_owned()]),
-            TyKind::Char => Some(vec!["'a'".to_owned(), "'\\0'".to_owned(), "'Z'".to_owned()]),
+            TyKind::Char => Some(vec![
+                "'a'".to_owned(),
+                "'\\0'".to_owned(),
+                "'Z'".to_owned(),
+                "'🦀'".to_owned(),
+            ]),
             TyKind::Int(int_ty) => {
                 let suffix = value_ty.to_string();
                 let mut options = vec![format!("0{suffix}"), format!("1{suffix}")];

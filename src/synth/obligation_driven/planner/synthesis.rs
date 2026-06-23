@@ -25,6 +25,21 @@ struct TargetQueueState {
     stop_reason: Option<&'static str>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TargetBudgetAllocation {
+    cap: usize,
+    distance: f32,
+    weight: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WeightedTarget {
+    target_api: usize,
+    weight: f32,
+}
+
+const UNLIMITED_TARGET_SEQUENCE_CAP: usize = usize::MAX;
+
 struct MutatorInsertion<'a> {
     call_index: usize,
     obligation_param_index: usize,
@@ -46,6 +61,22 @@ fn sequence_cap_reached(cap: usize, accepted: usize) -> bool {
     cap != 0 && accepted >= cap
 }
 
+fn target_sequence_cap_reached(cap: usize, accepted: usize) -> bool {
+    cap != UNLIMITED_TARGET_SEQUENCE_CAP && accepted >= cap
+}
+
+fn target_sequence_cap_for_metadata(cap: usize) -> usize {
+    if cap == UNLIMITED_TARGET_SEQUENCE_CAP {
+        0
+    } else {
+        cap
+    }
+}
+
+fn finite_target_sequence_cap(cap: usize) -> Option<usize> {
+    (cap != UNLIMITED_TARGET_SEQUENCE_CAP).then_some(cap)
+}
+
 fn min_nonzero_cap(left: usize, right: usize) -> usize {
     match (left, right) {
         (0, 0) => 0,
@@ -54,11 +85,185 @@ fn min_nonzero_cap(left: usize, right: usize) -> usize {
     }
 }
 
-fn pop_next_ranked_candidate(
+fn target_budget_weight(distance: f32, max_distance: f32) -> f32 {
+    if max_distance <= 0.0 {
+        return f32::from(distance == 0.0);
+    }
+    let ratio = distance / max_distance;
+    (1.0 - ratio * ratio).max(0.0)
+}
+
+fn allocate_target_budget_caps(
+    targets: &[WeightedTarget],
+    wrapper_sequence_cap: usize,
+    target_sequence_ceiling: usize,
+    target_sequence_floor: usize,
+) -> HashMap<usize, usize> {
+    let mut caps = targets
+        .iter()
+        .map(|target| (target.target_api, 0usize))
+        .collect::<HashMap<_, _>>();
+
+    if target_sequence_ceiling == 0 {
+        if wrapper_sequence_cap == 0 {
+            return targets
+                .iter()
+                .map(|target| (target.target_api, UNLIMITED_TARGET_SEQUENCE_CAP))
+                .collect();
+        }
+    } else if wrapper_sequence_cap == 0 {
+        return targets
+            .iter()
+            .map(|target| (target.target_api, target_sequence_ceiling))
+            .collect();
+    }
+
+    let floor = if target_sequence_ceiling == 0 {
+        target_sequence_floor
+    } else {
+        target_sequence_floor.min(target_sequence_ceiling)
+    };
+    if floor == 0 {
+        allocate_weighted_remainder_caps(
+            targets,
+            wrapper_sequence_cap,
+            target_sequence_ceiling,
+            &mut caps,
+        );
+        return caps;
+    }
+
+    let required_floor = targets.len().saturating_mul(floor);
+    if required_floor <= wrapper_sequence_cap {
+        for target in targets {
+            caps.insert(target.target_api, floor);
+        }
+        allocate_weighted_remainder_caps(
+            targets,
+            wrapper_sequence_cap - required_floor,
+            target_sequence_ceiling,
+            &mut caps,
+        );
+        return caps;
+    }
+
+    let mut ranked = targets.to_vec();
+    ranked.sort_by(|left, right| {
+        right
+            .weight
+            .partial_cmp(&left.weight)
+            .unwrap()
+            .then(left.target_api.cmp(&right.target_api))
+    });
+    let mut remaining = wrapper_sequence_cap;
+    let mut allocated_any = false;
+    for target in ranked {
+        if remaining < floor {
+            if !allocated_any && remaining > 0 {
+                caps.insert(target.target_api, remaining);
+            }
+            break;
+        }
+        caps.insert(target.target_api, floor);
+        remaining -= floor;
+        allocated_any = true;
+    }
+    caps
+}
+
+fn allocate_weighted_remainder_caps(
+    targets: &[WeightedTarget],
+    budget: usize,
+    ceiling: usize,
+    caps: &mut HashMap<usize, usize>,
+) {
+    if budget == 0 {
+        return;
+    }
+    let weighted = targets
+        .iter()
+        .filter(|target| {
+            target.weight > 0.0
+                && caps.get(&target.target_api).is_some_and(|cap| {
+                    *cap == UNLIMITED_TARGET_SEQUENCE_CAP || ceiling == 0 || *cap < ceiling
+                })
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if weighted.is_empty() {
+        return;
+    }
+    let total_weight = weighted.iter().map(|target| target.weight).sum::<f32>();
+    if total_weight <= 0.0 {
+        return;
+    }
+
+    let mut remaining = budget;
+    let mut remainders = Vec::new();
+    for target in &weighted {
+        let current = caps.get(&target.target_api).copied().unwrap_or(0);
+        let capacity = if ceiling == 0 {
+            budget
+        } else {
+            ceiling.saturating_sub(current).min(budget)
+        };
+        if capacity == 0 {
+            continue;
+        }
+        let exact = budget as f32 * target.weight / total_weight;
+        let extra = (exact.floor() as usize).min(capacity).min(remaining);
+        if let Some(cap) = caps.get_mut(&target.target_api) {
+            *cap += extra;
+        }
+        remaining -= extra;
+        remainders.push((target.target_api, exact.fract(), target.weight));
+    }
+
+    remainders.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap()
+            .then_with(|| right.2.partial_cmp(&left.2).unwrap())
+            .then(left.0.cmp(&right.0))
+    });
+    while remaining > 0 {
+        let mut allocated_this_round = false;
+        for (target_api, _fraction, _weight) in &remainders {
+            if remaining == 0 {
+                break;
+            }
+            let Some(cap) = caps.get_mut(target_api) else {
+                continue;
+            };
+            if ceiling != 0 && *cap >= ceiling {
+                continue;
+            }
+            *cap += 1;
+            remaining -= 1;
+            allocated_this_round = true;
+        }
+        if !allocated_this_round {
+            break;
+        }
+    }
+}
+
+fn pop_next_candidate(
     candidates: &mut Vec<SequenceCandidate>,
     states: &HashMap<usize, TargetQueueState>,
     tuning: &PlannerTuning,
+    ranking_enabled: bool,
 ) -> Option<(SequenceCandidate, CandidateEvaluation)> {
+    if !ranking_enabled {
+        if candidates.is_empty() {
+            return None;
+        }
+        let candidate = candidates.remove(0);
+        let evaluation = evaluate_candidate_for_states(&candidate, states, tuning);
+        return Some((candidate, evaluation));
+    }
+
     let best_index = candidates
         .iter()
         .enumerate()
@@ -96,21 +301,50 @@ fn evaluate_candidate_for_states(
         return evaluate_candidate(candidate, 0.0, 0.0, tuning);
     };
 
-    let reuse_penalty = if state.reuse_penalty_enabled {
-        candidate
-            .mutator_identity
-            .and_then(|identity| state.accepted_mutator_counts.get(&identity).copied())
-            .unwrap_or(0) as f32
+    let api_reuse_penalty = if state.reuse_penalty_enabled {
+        api_history_penalty(candidate, &state.accepted_sequences)
     } else {
         0.0
     };
-    let depth_penalty = if state.depth_penalty_enabled {
+    let length_penalty = if state.depth_penalty_enabled {
+        length_history_penalty(candidate, &state.accepted_sequences)
+    } else {
+        0.0
+    };
+    let depth_ordering_penalty = if state.depth_penalty_enabled {
         depth_saturation_penalty(candidate, state, tuning)
             + stagnation_depth_penalty(candidate, state, tuning)
     } else {
         0.0
     };
-    evaluate_candidate(candidate, reuse_penalty, depth_penalty, tuning)
+    evaluate_candidate(
+        candidate,
+        api_reuse_penalty + length_penalty,
+        depth_ordering_penalty,
+        tuning,
+    )
+}
+
+fn api_history_penalty(candidate: &SequenceCandidate, accepted: &[SequencePlan]) -> f32 {
+    candidate
+        .sequence
+        .steps
+        .iter()
+        .map(|candidate_step| {
+            accepted
+                .iter()
+                .flat_map(|sequence| sequence.steps.iter())
+                .filter(|accepted_step| accepted_step.api_index == candidate_step.api_index)
+                .count()
+        })
+        .sum::<usize>() as f32
+}
+
+fn length_history_penalty(candidate: &SequenceCandidate, accepted: &[SequencePlan]) -> f32 {
+    accepted
+        .iter()
+        .filter(|sequence| sequence.steps.len() == candidate.sequence.steps.len())
+        .count() as f32
 }
 
 fn depth_saturation_penalty(
@@ -134,7 +368,8 @@ fn stagnation_depth_penalty(
     let Some(depth_anchor) = state.stagnation_depth_anchor else {
         return 0.0;
     };
-    if state.target_sequence_cap == 0 {
+    if state.target_sequence_cap == 0 || state.target_sequence_cap == UNLIMITED_TARGET_SEQUENCE_CAP
+    {
         return 0.0;
     }
     if state.stagnation_penalty_level == 0
@@ -154,7 +389,8 @@ fn update_stagnation_phase(
     sequence_ratio: f32,
     tuning: &PlannerTuning,
 ) {
-    if state.target_sequence_cap == 0 {
+    if state.target_sequence_cap == 0 || state.target_sequence_cap == UNLIMITED_TARGET_SEQUENCE_CAP
+    {
         return;
     }
 
@@ -265,42 +501,66 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         );
     }
 
-    pub(super) fn synthesize_target_group_unlimited(
-        &mut self,
+    fn allocate_wrapper_target_budgets(
+        &self,
         unsafe_wrapper: &str,
         target_group: &[usize],
-        sequences: &mut Vec<SequencePlan>,
-        target_summaries: &mut Vec<TargetSynthesisSummary>,
-    ) {
-        let group_start = Instant::now();
-        info!(
-            target: "foursafer::planner",
-            "obligation-driven unlimited function `{}` has {} target api instances",
-            unsafe_wrapper,
-            target_group.len()
+        wrapper_sequence_cap: usize,
+    ) -> HashMap<usize, TargetBudgetAllocation> {
+        let targets = target_group
+            .iter()
+            .map(|&target_api| {
+                let distance = self.wrapper_target_distance(target_api, unsafe_wrapper);
+                let weight = target_budget_weight(distance, self.wrapper_target_max_distance);
+                WeightedTarget { target_api, weight }
+            })
+            .collect::<Vec<_>>();
+        let mut allocations = targets
+            .iter()
+            .map(|target| {
+                let distance = self.wrapper_target_distance(target.target_api, unsafe_wrapper);
+                (
+                    target.target_api,
+                    TargetBudgetAllocation {
+                        cap: 0,
+                        distance,
+                        weight: target.weight,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let caps = allocate_target_budget_caps(
+            &targets,
+            wrapper_sequence_cap,
+            self.max_sequences_per_target,
+            self.caps.floor_sequences_per_target,
         );
-
-        for &target_api in target_group {
-            if self.sequence_limit_reached(sequences.len()) {
-                info!(
-                    target: "foursafer::planner",
-                    "global suite sequence cap reached; skipping remaining targets in `{}`",
-                    unsafe_wrapper
-                );
-                break;
+        for (target_api, cap) in caps {
+            if let Some(allocation) = allocations.get_mut(&target_api) {
+                allocation.cap = cap;
             }
-            let (target_sequences, target_summary) =
-                self.synthesize_target_suite_unlimited(target_api, unsafe_wrapper);
-            self.append_target_sequences(sequences, target_sequences);
-            target_summaries.push(target_summary);
         }
+        allocations
+    }
 
-        info!(
-            target: "foursafer::planner",
-            "obligation-driven unlimited function `{}` finished in {:.2?}",
-            unsafe_wrapper,
-            group_start.elapsed()
-        );
+    fn default_target_budget_allocation(&self, target_api: usize) -> TargetBudgetAllocation {
+        let distance = self
+            .wrapper_target_distance(target_api, &self.apis[target_api].primary_unsafe_wrapper());
+        TargetBudgetAllocation {
+            cap: self.max_sequences_per_target,
+            distance,
+            weight: target_budget_weight(distance, self.wrapper_target_max_distance),
+        }
+    }
+
+    fn wrapper_target_distance(&self, target_api: usize, unsafe_wrapper: &str) -> f32 {
+        let api = &self.apis[target_api];
+        if matches!(api.api_safety, ApiSafety::UnsafeBlock)
+            || api.instantiated_path == unsafe_wrapper
+        {
+            return 0.0;
+        }
+        average_target_distance(api).unwrap_or(self.wrapper_target_max_distance + 1.0)
     }
 
     fn synthesize_wrapper_group_with_candidate_queue(
@@ -309,16 +569,26 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         target_group: &[usize],
         wrapper_sequence_cap: usize,
     ) -> (Vec<SequencePlan>, Vec<TargetSynthesisSummary>) {
+        let target_allocations = self.allocate_wrapper_target_budgets(
+            unsafe_wrapper,
+            target_group,
+            wrapper_sequence_cap,
+        );
         let mut states = target_group
             .iter()
             .filter_map(|&target_api| {
-                self.initialize_target_state(target_api, unsafe_wrapper)
+                let allocation = target_allocations
+                    .get(&target_api)
+                    .copied()
+                    .unwrap_or_else(|| self.default_target_budget_allocation(target_api));
+                self.initialize_target_state(target_api, unsafe_wrapper, allocation.cap)
                     .map(|state| (target_api, state))
             })
             .collect::<HashMap<_, _>>();
 
-        let mut queue = states
-            .values()
+        let mut queue = target_group
+            .iter()
+            .filter_map(|target_api| states.get(target_api))
             .flat_map(|state| state.queue.iter().cloned())
             .collect::<Vec<_>>();
         for state in states.values_mut() {
@@ -327,7 +597,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
 
         let mut wrapper_sequences_accepted = 0usize;
         while let Some((mut candidate, evaluation)) =
-            pop_next_ranked_candidate(&mut queue, &states, &self.tuning)
+            pop_next_candidate(&mut queue, &states, &self.tuning, self.ranking_enabled)
         {
             let target_api = candidate.sequence.target_api;
 
@@ -355,7 +625,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             let Some(state_view) = states.get(&target_api) else {
                 continue;
             };
-            if sequence_cap_reached(
+            if target_sequence_cap_reached(
                 state_view.target_sequence_cap,
                 state_view.accepted_sequences.len(),
             ) {
@@ -379,13 +649,14 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             };
             let candidate_depth = candidate.expansion_depth;
             let current_index = state.accepted_sequences.len();
-            let previous_sequence_ratio = if state.target_sequence_cap > 0 {
-                state.accepted_sequences.len() as f32 / state.target_sequence_cap as f32
-            } else {
-                0.0
-            };
+            let previous_sequence_ratio =
+                if let Some(cap) = finite_target_sequence_cap(state.target_sequence_cap) {
+                    state.accepted_sequences.len() as f32 / cap as f32
+                } else {
+                    0.0
+                };
             let predecessor = candidate.sequence.predecessor;
-            candidate.sequence.ranking_value = evaluation.queue_priority;
+            candidate.sequence.ranking_value = evaluation.priority_score;
             candidate.sequence.construction_cost = evaluation.construction_cost;
             candidate.sequence.prefix_distance = evaluation.prefix_distance;
             candidate.sequence.target_to_wrapper_distance = evaluation.target_to_wrapper_distance;
@@ -409,14 +680,18 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             if let Some(identity) = candidate.mutator_identity {
                 *state.accepted_mutator_counts.entry(identity).or_insert(0) += 1;
             }
-            let sequence_ratio = if state.target_sequence_cap > 0 {
-                state.accepted_sequences.len() as f32 / state.target_sequence_cap as f32
-            } else {
-                0.0
-            };
+            let sequence_ratio =
+                if let Some(cap) = finite_target_sequence_cap(state.target_sequence_cap) {
+                    state.accepted_sequences.len() as f32 / cap as f32
+                } else {
+                    0.0
+                };
             update_stagnation_phase(state, previous_sequence_ratio, sequence_ratio, &self.tuning);
 
-            if sequence_cap_reached(state.target_sequence_cap, state.accepted_sequences.len()) {
+            if target_sequence_cap_reached(
+                state.target_sequence_cap,
+                state.accepted_sequences.len(),
+            ) {
                 state
                     .stop_reason
                     .get_or_insert("target_sequence_cap_reached");
@@ -459,8 +734,12 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
 
             let mut new_candidates = expansion.candidates;
             stat.raw_candidates += new_candidates.len();
-            new_candidates =
-                rank_and_limit_mutation_candidates(new_candidates, round, &self.tuning);
+            if self.ranking_enabled {
+                new_candidates =
+                    rank_and_limit_mutation_candidates(new_candidates, round, &self.tuning);
+            } else {
+                new_candidates.truncate(mutation_round_limit(round, &self.tuning));
+            }
             stat.selected_candidates += new_candidates.len();
 
             let mut retained = 0usize;
@@ -484,6 +763,10 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             let Some(mut state) = states.remove(target_api) else {
                 continue;
             };
+            let allocation = target_allocations
+                .get(target_api)
+                .copied()
+                .unwrap_or_else(|| self.default_target_budget_allocation(*target_api));
             if state.accepted_sequences.is_empty() {
                 state.stop_reason.get_or_insert("no_base_sequences");
             } else if state.stop_reason.is_none() {
@@ -503,9 +786,10 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 base_materialization_failure: state.base_materialization_failure,
                 wrapper_sequence_cap,
                 wrapper_sequences_accepted,
-                target_sequence_cap: state.target_sequence_cap,
+                wrapper_target_distance: allocation.distance,
+                wrapper_target_weight: allocation.weight,
+                target_sequence_cap: target_sequence_cap_for_metadata(state.target_sequence_cap),
                 target_sequences_accepted: state.accepted_sequences.len(),
-                basic_sequence_cap: self.max_basic_sequences_per_target,
                 rejected_candidates_wrapper_sequence_cap: state
                     .rejected_candidates_wrapper_sequence_cap,
                 rejected_candidates_target_sequence_cap: state
@@ -527,257 +811,11 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         (all_sequences, summaries)
     }
 
-    fn synthesize_target_suite_unlimited(
-        &mut self,
-        target_api: usize,
-        unsafe_wrapper: &str,
-    ) -> (Vec<SequencePlan>, TargetSynthesisSummary) {
-        let obligated_param_selection = select_obligated_params(&self.apis[target_api]);
-        if obligated_param_selection.params.is_empty() && !self.apis[target_api].inputs.is_empty() {
-            return (
-                Vec::new(),
-                TargetSynthesisSummary {
-                    target_api,
-                    unsafe_wrapper: unsafe_wrapper.to_owned(),
-                    obligated_params: Vec::new(),
-                    has_explicit_obligations: obligated_param_selection.has_explicit_obligations,
-                    base_sequences_before_cap: 0,
-                    base_sequences_after_cap: 0,
-                    base_materialization_failure: Some("no_obligated_params"),
-                    wrapper_sequence_cap: 0,
-                    wrapper_sequences_accepted: 0,
-                    target_sequence_cap: 0,
-                    target_sequences_accepted: 0,
-                    basic_sequence_cap: 0,
-                    rejected_candidates_wrapper_sequence_cap: 0,
-                    rejected_candidates_target_sequence_cap: 0,
-                    mutator_rounds: Vec::new(),
-                    stop_reason: "no_obligated_params",
-                },
-            );
-        }
-
-        let mut seen_signatures = HashSet::new();
-        let (basic_candidates, base_sequences_before_cap, base_materialization_failure) = self
-            .synthesize_base_target_sequences(
-                target_api,
-                unsafe_wrapper,
-                &obligated_param_selection,
-                &mut seen_signatures,
-            );
-        let (mut target_sequences, mutator_rounds, stop_reason) = self
-            .generate_target_sequences_with_candidate_queue_unlimited(
-                basic_candidates,
-                &mut seen_signatures,
-            );
-
-        if obligated_param_selection.params.len() > 1
-            && target_sequences
-                .iter()
-                .any(|sequence| sequence.predecessor.is_some())
-            && target_sequences.len() > self.caps.multi_obligated_param_sequences_per_target
-        {
-            cap_sequence_plans_preserving_predecessors(
-                &mut target_sequences,
-                self.caps.multi_obligated_param_sequences_per_target,
-            );
-        }
-
-        let stop_reason = if target_sequences.is_empty() {
-            "no_base_sequences"
-        } else {
-            stop_reason
-        };
-        (
-            target_sequences.clone(),
-            TargetSynthesisSummary {
-                target_api,
-                unsafe_wrapper: unsafe_wrapper.to_owned(),
-                obligated_params: obligated_param_selection.params,
-                has_explicit_obligations: obligated_param_selection.has_explicit_obligations,
-                base_sequences_before_cap,
-                base_sequences_after_cap: target_sequences
-                    .iter()
-                    .filter(|sequence| sequence.predecessor.is_none())
-                    .count(),
-                base_materialization_failure: if target_sequences.is_empty() {
-                    base_materialization_failure
-                } else {
-                    None
-                },
-                wrapper_sequence_cap: 0,
-                wrapper_sequences_accepted: target_sequences.len(),
-                target_sequence_cap: 0,
-                target_sequences_accepted: target_sequences.len(),
-                basic_sequence_cap: 0,
-                rejected_candidates_wrapper_sequence_cap: 0,
-                rejected_candidates_target_sequence_cap: 0,
-                mutator_rounds,
-                stop_reason,
-            },
-        )
-    }
-
-    fn generate_target_sequences_with_candidate_queue_unlimited(
-        &mut self,
-        mut queue: Vec<SequenceCandidate>,
-        seen_signatures: &mut HashSet<u64>,
-    ) -> (Vec<SequencePlan>, Vec<MutatorRoundSummary>, &'static str) {
-        let mut target_sequences: Vec<SequencePlan> = Vec::new();
-        let mut stats_by_round = HashMap::<usize, MutatorRoundSummary>::new();
-
-        loop {
-            if self.sequence_limit_reached(target_sequences.len()) {
-                return (
-                    target_sequences,
-                    finalize_round_summaries(stats_by_round, Some("suite_sequence_cap_reached")),
-                    "suite_sequence_cap_reached",
-                );
-            }
-            if self.max_sequences != 0
-                && !queue.is_empty()
-                && target_sequences.len() + queue.len() >= self.max_sequences
-            {
-                self.drain_unlimited_queue_to_sequence_cap(&mut target_sequences, &mut queue);
-                return (
-                    target_sequences,
-                    finalize_round_summaries(stats_by_round, Some("suite_sequence_cap_reached")),
-                    "suite_sequence_cap_reached",
-                );
-            }
-
-            let Some(candidate) = pop_next_unlimited_candidate(&mut queue, &self.tuning) else {
-                break;
-            };
-            let current_index = target_sequences.len();
-
-            let predecessor = candidate.sequence.predecessor;
-            let sequence = candidate.sequence;
-            if let Some(predecessor) = predecessor {
-                target_sequences[predecessor].successor.push(current_index);
-            }
-            target_sequences.push(sequence.clone());
-
-            if self.sequence_limit_reached(target_sequences.len()) {
-                return (
-                    target_sequences,
-                    finalize_round_summaries(stats_by_round, Some("suite_sequence_cap_reached")),
-                    "suite_sequence_cap_reached",
-                );
-            }
-
-            if candidate.expansion_depth >= self.max_mutators_per_target {
-                continue;
-            }
-
-            let expansion = self.expand_with_mutators(&sequence);
-            let round = candidate.expansion_depth;
-            let stat = stats_by_round.entry(round).or_insert(MutatorRoundSummary {
-                round,
-                parent_sequences_considered: 0,
-                raw_candidates: 0,
-                duplicate_candidates: 0,
-                depth_pruned_candidates: 0,
-                selected_candidates: 0,
-                retained_candidates: 0,
-                stop_reason: None,
-            });
-            stat.parent_sequences_considered += 1;
-            stat.depth_pruned_candidates += expansion.depth_pruned_candidates;
-
-            let mut new_candidates = expansion.candidates;
-            stat.raw_candidates += new_candidates.len();
-            if self.max_sequences != 0 {
-                let remaining_candidate_capacity = self
-                    .max_sequences
-                    .saturating_sub(target_sequences.len() + queue.len());
-                if remaining_candidate_capacity == 0 {
-                    return (
-                        target_sequences,
-                        finalize_round_summaries(
-                            stats_by_round,
-                            Some("suite_sequence_cap_reached"),
-                        ),
-                        "suite_sequence_cap_reached",
-                    );
-                }
-                new_candidates = rank_and_truncate_sequence_candidates(
-                    new_candidates,
-                    remaining_candidate_capacity,
-                    &self.tuning,
-                );
-            } else if !self.relax_sequence_limit_filters {
-                new_candidates =
-                    rank_and_limit_mutation_candidates(new_candidates, round, &self.tuning);
-            }
-            stat.selected_candidates += new_candidates.len();
-
-            let mut retained = 0usize;
-            for mut child in new_candidates {
-                let signature = sequence_signature(&child.sequence.steps);
-                if !seen_signatures.insert(signature) {
-                    stat.duplicate_candidates += 1;
-                    continue;
-                }
-                child.sequence.predecessor = Some(current_index);
-                child.expansion_depth = candidate.expansion_depth + 1;
-                queue.push(child);
-                retained += 1;
-            }
-            stat.retained_candidates += retained;
-        }
-
-        if self.max_mutators_per_target == 0 {
-            return (
-                target_sequences,
-                finalize_round_summaries(stats_by_round, Some("mutator_limit_zero")),
-                "mutator_limit_zero",
-            );
-        }
-        let stop_reason = if target_sequences
-            .iter()
-            .any(|sequence| sequence.predecessor.is_some())
-        {
-            "no_new_mutator_candidates"
-        } else {
-            "basic_queue_exhausted"
-        };
-        (
-            target_sequences,
-            finalize_round_summaries(stats_by_round, Some(stop_reason)),
-            stop_reason,
-        )
-    }
-
-    fn drain_unlimited_queue_to_sequence_cap(
-        &self,
-        target_sequences: &mut Vec<SequencePlan>,
-        queue: &mut Vec<SequenceCandidate>,
-    ) {
-        let Some(remaining) = self.remaining_sequence_capacity(target_sequences.len()) else {
-            return;
-        };
-        if remaining == 0 {
-            return;
-        }
-
-        rank_sequence_candidates(queue, &self.tuning);
-        queue.truncate(remaining);
-        for candidate in queue.drain(..) {
-            let current_index = target_sequences.len();
-            let predecessor = candidate.sequence.predecessor;
-            let sequence = candidate.sequence;
-            if let Some(predecessor) = predecessor {
-                target_sequences[predecessor].successor.push(current_index);
-            }
-            target_sequences.push(sequence);
-        }
-    }
-
     fn initialize_target_state(
         &mut self,
         target_api: usize,
         unsafe_wrapper: &str,
+        target_sequence_cap: usize,
     ) -> Option<TargetQueueState> {
         let obligated_param_selection = select_obligated_params(&self.apis[target_api]);
         if obligated_param_selection.params.is_empty() && !self.apis[target_api].inputs.is_empty() {
@@ -792,7 +830,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 queue: Vec::new(),
                 accepted_sequences: Vec::new(),
                 stats_by_round: HashMap::new(),
-                target_sequence_cap: self.max_sequences_per_target,
+                target_sequence_cap,
                 accepted_mutator_counts: HashMap::new(),
                 accepted_depth_counts: HashMap::new(),
                 max_accepted_mutator_depth: 0,
@@ -827,7 +865,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             queue: basic_candidates,
             accepted_sequences: Vec::new(),
             stats_by_round: HashMap::new(),
-            target_sequence_cap: self.max_sequences_per_target,
+            target_sequence_cap,
             accepted_mutator_counts: HashMap::new(),
             accepted_depth_counts: HashMap::new(),
             max_accepted_mutator_depth: 0,
@@ -838,7 +876,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             depth_penalty_enabled: self.depth_penalty_enabled,
             rejected_candidates_wrapper_sequence_cap: 0,
             rejected_candidates_target_sequence_cap: 0,
-            stop_reason: None,
+            stop_reason: (target_sequence_cap == 0).then_some("target_sequence_cap_reached"),
         })
     }
 
@@ -884,9 +922,8 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 mutated_param,
             ));
         }
-        rank_sequence_candidates(&mut target_sequences, &self.tuning);
-        if !self.relax_sequence_limit_filters && self.max_basic_sequences_per_target != 0 {
-            target_sequences.truncate(self.max_basic_sequences_per_target);
+        if self.ranking_enabled {
+            rank_sequence_candidates(&mut target_sequences, &self.tuning);
         }
         if let Some(limit) = self.sequence_generation_limit() {
             target_sequences.truncate(limit);
@@ -994,41 +1031,39 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                     &obligation,
                 )
                 .unwrap_or(call_distance as f32);
-                mutator_candidates.sort_by(|left, right| {
-                    let left_provided = call_provided_fields(&self.apis[left.0], left.1);
-                    let right_provided = call_provided_fields(&self.apis[right.0], right.1);
-                    mutator_candidate_rank_key(
-                        base,
-                        left.0,
-                        &left_provided,
-                        &obligation,
-                        call_distance,
-                        target_distance,
-                        &self.tuning,
-                    )
-                    .cmp(&mutator_candidate_rank_key(
-                        base,
-                        right.0,
-                        &right_provided,
-                        &obligation,
-                        call_distance,
-                        target_distance,
-                        &self.tuning,
-                    ))
-                    .then(
-                        left_provided.len().cmp(&right_provided.len()).then(
-                            self.apis[left.0]
-                                .inputs
-                                .len()
-                                .cmp(&self.apis[right.0].inputs.len()),
-                        ),
-                    )
-                });
-                if !self.relax_sequence_limit_filters {
-                    mutator_candidates.truncate(self.tuning.max_mutator_candidates_per_param);
-                } else if let Some(limit) = candidate_limit {
-                    mutator_candidates.truncate(limit);
+                if self.ranking_enabled {
+                    mutator_candidates.sort_by(|left, right| {
+                        let left_provided = call_provided_fields(&self.apis[left.0], left.1);
+                        let right_provided = call_provided_fields(&self.apis[right.0], right.1);
+                        mutator_candidate_rank_key(
+                            base,
+                            left.0,
+                            &left_provided,
+                            &obligation,
+                            call_distance,
+                            target_distance,
+                            &self.tuning,
+                        )
+                        .cmp(&mutator_candidate_rank_key(
+                            base,
+                            right.0,
+                            &right_provided,
+                            &obligation,
+                            call_distance,
+                            target_distance,
+                            &self.tuning,
+                        ))
+                        .then(
+                            left_provided.len().cmp(&right_provided.len()).then(
+                                self.apis[left.0]
+                                    .inputs
+                                    .len()
+                                    .cmp(&self.apis[right.0].inputs.len()),
+                            ),
+                        )
+                    });
                 }
+                mutator_candidates.truncate(self.tuning.max_mutator_candidates_per_param);
                 debug!(
                     target: "foursafer::planner",
                     "mutator screening: target=`{}` call=`{}` param={} obligation={:?} receiver_source={:?} matching_candidates={}",
@@ -1229,10 +1264,15 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
 
         let construction_cost = 1.0 + plan.prefix.len() as f32;
         let target_to_wrapper_distance = insertion.target_distance;
-        let total_distance = self.tuning.prefix_distance_weight * insertion.prefix_distance
-            + self.tuning.target_distance_weight * target_to_wrapper_distance;
-        let queue_priority =
-            self.tuning.construction_cost_weight * construction_cost + total_distance;
+        let total_distance = insertion.prefix_distance + target_to_wrapper_distance;
+        let flow_score = flow_score_for_parts(
+            insertion.selected_obligation_fields.len(),
+            insertion.prefix_distance,
+            target_to_wrapper_distance,
+            &self.tuning,
+        );
+        let ranking_value = flow_score - self.tuning.cost_weight * construction_cost;
+        let queue_priority = -ranking_value;
 
         Some(SequenceCandidate {
             construction_cost,
@@ -1258,7 +1298,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 selected_obligation_call: Some(call_index + inserted_count),
                 selected_obligation_param: Some(insertion.obligation_param_index),
                 selected_obligation_fields: insertion.selected_obligation_fields.clone(),
-                ranking_value: queue_priority,
+                ranking_value,
                 construction_cost,
                 prefix_distance: insertion.prefix_distance,
                 target_to_wrapper_distance,
@@ -1281,10 +1321,9 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         let target_distance = average_target_distance(&self.apis[target_api]).unwrap_or(0.0);
         let prefix_distance = steps.len().saturating_sub(1) as f32;
         let target_to_wrapper_distance = target_distance;
-        let total_distance = self.tuning.prefix_distance_weight * prefix_distance
-            + self.tuning.target_distance_weight * target_to_wrapper_distance;
-        let queue_priority =
-            self.tuning.construction_cost_weight * construction_cost + total_distance;
+        let total_distance = prefix_distance + target_to_wrapper_distance;
+        let ranking_value = -self.tuning.cost_weight * construction_cost;
+        let queue_priority = -ranking_value;
 
         SequenceCandidate {
             construction_cost,
@@ -1303,7 +1342,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 selected_obligation_call: None,
                 selected_obligation_param: None,
                 selected_obligation_fields: FieldSet::new(),
-                ranking_value: queue_priority,
+                ranking_value,
                 construction_cost,
                 prefix_distance,
                 target_to_wrapper_distance,
@@ -1364,13 +1403,12 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             });
         }
         let mut obligated_steps = dedupe_obligated_param_steps(base_variants);
-        if let Some(limit) = sequence_limit {
+        let limit =
+            sequence_limit.unwrap_or(self.tuning.max_materialized_variants_per_obligated_param);
+        if self.ranking_enabled {
             rank_and_truncate_obligated_param_steps(&mut obligated_steps, limit);
-        } else if !self.relax_sequence_limit_filters {
-            rank_and_truncate_obligated_param_steps(
-                &mut obligated_steps,
-                self.tuning.max_materialized_variants_per_obligated_param,
-            );
+        } else {
+            obligated_steps.truncate(limit);
         }
         obligated_steps
     }
@@ -1428,12 +1466,11 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                     .extend(self.basic_sequences_ended_with_constructor(constructor, api_stack));
                 if let Some(limit) = sequence_limit {
                     constructor_sequences = dedupe_step_sequences(constructor_sequences);
-                    rank_and_truncate_step_sequences(&mut constructor_sequences, limit);
+                    self.truncate_step_sequences(&mut constructor_sequences, limit);
                     if constructor_sequences.len() >= limit {
                         break;
                     }
-                } else if !self.relax_sequence_limit_filters
-                    && constructor_sequences.len() >= self.tuning.max_basic_constructor_sequences
+                } else if constructor_sequences.len() >= self.tuning.max_basic_constructor_sequences
                 {
                     break;
                 }
@@ -1456,7 +1493,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
 
             prefixes = dedupe_step_sequences(next_prefixes);
             if let Some(limit) = sequence_limit {
-                rank_and_truncate_step_sequences(&mut prefixes, limit);
+                self.truncate_step_sequences(&mut prefixes, limit);
             }
         }
 
@@ -1469,9 +1506,9 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             .collect::<Vec<_>>();
         let mut sequences = dedupe_step_sequences(sequences);
         if let Some(limit) = self.sequence_generation_limit() {
-            rank_and_truncate_step_sequences(&mut sequences, limit);
-        } else if !self.relax_sequence_limit_filters {
-            rank_and_truncate_step_sequences(
+            self.truncate_step_sequences(&mut sequences, limit);
+        } else {
+            self.truncate_step_sequences(
                 &mut sequences,
                 self.tuning.max_basic_constructor_sequences,
             );
@@ -1528,15 +1565,15 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 &constructor_sequences,
             );
             if let Some(limit) = self.sequence_generation_limit() {
-                rank_and_truncate_partial_call_plans(&mut partials, limit);
+                self.truncate_partial_call_plans(&mut partials, limit);
             }
         }
 
         let mut deduped = dedupe_call_plans(partials);
         if let Some(limit) = self.sequence_generation_limit() {
-            rank_and_truncate_call_plans(&mut deduped, limit);
-        } else if !self.relax_sequence_limit_filters {
-            rank_and_truncate_call_plans(&mut deduped, self.tuning.max_call_plan_candidates);
+            self.truncate_call_plans(&mut deduped, limit);
+        } else {
+            self.truncate_call_plans(&mut deduped, self.tuning.max_call_plan_candidates);
         }
 
         self.call_plan_cache
@@ -1587,15 +1624,15 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 &constructor_sequences,
             );
             if let Some(limit) = self.sequence_generation_limit() {
-                rank_and_truncate_partial_call_plans(&mut partials, limit);
+                self.truncate_partial_call_plans(&mut partials, limit);
             }
         }
 
         let mut deduped = dedupe_call_plans(partials);
         if let Some(limit) = self.sequence_generation_limit() {
-            rank_and_truncate_call_plans(&mut deduped, limit);
-        } else if !self.relax_sequence_limit_filters {
-            rank_and_truncate_call_plans(&mut deduped, self.tuning.max_target_plan_candidates);
+            self.truncate_call_plans(&mut deduped, limit);
+        } else {
+            self.truncate_call_plans(&mut deduped, self.tuning.max_target_plan_candidates);
         }
         Some(deduped)
     }
@@ -1618,7 +1655,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 .extend(self.basic_sequences_ended_with_constructor(constructor, &mut Vec::new()));
             if let Some(limit) = sequence_limit {
                 constructor_sequences = dedupe_step_sequences(constructor_sequences);
-                rank_and_truncate_step_sequences(&mut constructor_sequences, limit);
+                self.truncate_step_sequences(&mut constructor_sequences, limit);
                 if constructor_sequences.len() >= limit {
                     break;
                 }
@@ -1648,22 +1685,59 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         candidates
     }
 
-    fn rank_and_truncate_constructor_candidates(&self, candidates: &mut Vec<usize>) {
-        candidates.sort_by(|left, right| {
-            constructor_candidate_priority(&self.apis[*left])
-                .cmp(&constructor_candidate_priority(&self.apis[*right]))
-                .then_with(|| self.apis[*left].path.cmp(&self.apis[*right].path))
-                .then_with(|| {
-                    self.apis[*left]
-                        .instantiated_path
-                        .cmp(&self.apis[*right].instantiated_path)
-                })
-                .then(left.cmp(right))
-        });
-        candidates.dedup();
-        if !self.relax_sequence_limit_filters {
-            candidates.truncate(self.tuning.max_basic_constructor_sequences);
+    fn truncate_step_sequences(&self, sequences: &mut Vec<Vec<CallStep>>, limit: usize) {
+        if self.ranking_enabled {
+            rank_and_truncate_step_sequences(sequences, limit);
+        } else {
+            sequences.truncate(limit);
         }
+    }
+
+    fn truncate_call_plans(&self, plans: &mut Vec<CallPlan>, limit: usize) {
+        if self.ranking_enabled {
+            rank_and_truncate_call_plans(plans, limit);
+        } else {
+            plans.truncate(limit);
+        }
+    }
+
+    fn truncate_partial_call_plans(&self, partials: &mut Vec<PartialCallPlan>, limit: usize) {
+        if self.ranking_enabled {
+            rank_and_truncate_partial_call_plans(partials, limit);
+        } else {
+            partials.truncate(limit);
+        }
+    }
+
+    fn truncate_combined_sequences(
+        &self,
+        sequences: &mut Vec<CombinedObligatedParamSteps>,
+        limit: usize,
+    ) {
+        if self.ranking_enabled {
+            rank_and_truncate_combined_sequences(sequences, limit);
+        } else {
+            sequences.truncate(limit);
+        }
+    }
+
+    fn rank_and_truncate_constructor_candidates(&self, candidates: &mut Vec<usize>) {
+        if self.ranking_enabled {
+            candidates.sort_by(|left, right| {
+                constructor_candidate_priority(&self.apis[*left])
+                    .cmp(&constructor_candidate_priority(&self.apis[*right]))
+                    .then_with(|| self.apis[*left].path.cmp(&self.apis[*right].path))
+                    .then_with(|| {
+                        self.apis[*left]
+                            .instantiated_path
+                            .cmp(&self.apis[*right].instantiated_path)
+                    })
+                    .then(left.cmp(right))
+            });
+        }
+        let mut seen = HashSet::new();
+        candidates.retain(|candidate| seen.insert(*candidate));
+        candidates.truncate(self.tuning.max_basic_constructor_sequences);
     }
 
     fn filtered_constructor_candidates_for_input(
@@ -1719,12 +1793,6 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             .collect::<Vec<_>>();
         let is_indirect_target =
             matches!(self.apis[target_api].api_safety, ApiSafety::IndirectUnsafe);
-        let should_cap_multi_obligated_param_sequences = is_indirect_target
-            && has_explicit_root_obligations
-            && obligated_params.len() > 1
-            && candidates
-                .iter()
-                .any(|candidate| candidate.mutator_count > 0);
         let Some(mut target_plans) = self.build_target_plans(target_api, &obligated_params) else {
             return MaterializedTargetSuites {
                 sequences: Vec::new(),
@@ -1733,7 +1801,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         };
         let sequence_limit = self.sequence_generation_limit();
         if let Some(limit) = sequence_limit {
-            rank_and_truncate_call_plans(&mut target_plans, limit);
+            self.truncate_call_plans(&mut target_plans, limit);
         }
 
         let mut sequences = Vec::new();
@@ -1791,9 +1859,9 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 }
                 combined = dedupe_combined_sequences(next);
                 if let Some(limit) = sequence_limit {
-                    rank_and_truncate_combined_sequences(&mut combined, limit);
-                } else if !self.relax_sequence_limit_filters {
-                    rank_and_truncate_combined_sequences(
+                    self.truncate_combined_sequences(&mut combined, limit);
+                } else {
+                    self.truncate_combined_sequences(
                         &mut combined,
                         self.tuning.max_combined_prefixes,
                     );
@@ -1811,8 +1879,15 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             if before_depth_filter > 0 && combined.is_empty() {
                 saw_depth_pruned_combined_prefix = true;
             }
-            if !self.relax_sequence_limit_filters && should_cap_combined {
-                rank_and_truncate_combined_sequences(&mut combined, self.tuning.top_k_candidates);
+            if should_cap_combined {
+                if self.ranking_enabled {
+                    rank_and_truncate_combined_sequences(
+                        &mut combined,
+                        self.tuning.top_k_candidates,
+                    );
+                } else {
+                    combined.truncate(self.tuning.top_k_candidates);
+                }
             }
 
             'emit_sequences: for combined_prefix in combined {
@@ -1842,7 +1917,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             }
         }
         let has_mutator_materialization = sequences.iter().any(|sequence| sequence.3 > 0);
-        if has_mutator_materialization {
+        if self.ranking_enabled && has_mutator_materialization {
             sequences.sort_by(|left, right| {
                 left.3
                     .cmp(&right.3)
@@ -1853,12 +1928,8 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             });
             if let Some(limit) = sequence_limit {
                 sequences.truncate(limit);
-            } else if !self.relax_sequence_limit_filters
-                && should_cap_multi_obligated_param_sequences
-            {
-                sequences.truncate(self.caps.multi_obligated_param_sequences_per_target);
             }
-        } else {
+        } else if self.ranking_enabled {
             sequences.sort_by(|left, right| {
                 left.1
                     .partial_cmp(&right.1)
@@ -1870,12 +1941,6 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         }
         if let Some(limit) = sequence_limit {
             sequences.truncate(limit);
-        } else if !self.relax_sequence_limit_filters
-            && is_indirect_target
-            && has_explicit_root_obligations
-            && obligated_params.len() > 1
-        {
-            sequences.truncate(self.caps.multi_obligated_param_sequences_per_target);
         }
         let sequences = sequences
             .into_iter()
@@ -1971,8 +2036,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                     round_added += 1;
                     added.push(index);
 
-                    if !self.relax_sequence_limit_filters && matched + round_matched >= match_limit
-                    {
+                    if matched + round_matched >= match_limit {
                         matched += round_matched;
                         break 'scan;
                     }
@@ -2164,6 +2228,12 @@ mod tests {
         }
     }
 
+    fn test_sequence_with_fields(fields: FieldSet) -> SequenceCandidate {
+        let mut candidate = test_sequence(0);
+        candidate.sequence.selected_obligation_fields = fields;
+        candidate
+    }
+
     fn test_state(target_sequence_cap: usize) -> TargetQueueState {
         TargetQueueState {
             target_api: 0,
@@ -2206,5 +2276,106 @@ mod tests {
             stagnation_depth_penalty(&test_sequence(2), &state, &tuning),
             0.0
         );
+    }
+
+    #[test]
+    fn ranking_uses_flow_minus_weighted_construction_cost() {
+        let tuning = PlannerTuning::default();
+        let mut candidate = test_sequence_with_fields(FieldSet::from([vec![0]]));
+        candidate.prefix_distance = 1.0;
+        candidate.sequence.prefix_distance = 1.0;
+
+        let evaluation = evaluate_candidate(&candidate, 0.0, 0.0, &tuning);
+
+        assert!((evaluation.priority_score - 0.4).abs() < f32::EPSILON);
+        assert!((evaluation.queue_priority + 0.4).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn ranking_penalizes_reused_apis_and_lengths() {
+        let tuning = PlannerTuning::default();
+        let mut state = test_state(4);
+        state.accepted_sequences.push(test_sequence(0).sequence);
+
+        let evaluation =
+            evaluate_candidate_for_states(&test_sequence(0), &HashMap::from([(0, state)]), &tuning);
+
+        assert_eq!(evaluation.reuse_penalty, 2.0);
+        assert!((evaluation.priority_score + 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn target_budget_weight_decays_quadratically_to_zero() {
+        assert_eq!(target_budget_weight(0.0, 4.0), 1.0);
+        assert!((target_budget_weight(2.0, 4.0) - 0.75).abs() < f32::EPSILON);
+        assert_eq!(target_budget_weight(4.0, 4.0), 0.0);
+        assert_eq!(target_budget_weight(5.0, 4.0), 0.0);
+    }
+
+    #[test]
+    fn target_budget_allocation_respects_floor_and_ceiling() {
+        let targets = vec![
+            WeightedTarget {
+                target_api: 0,
+                weight: 1.0,
+            },
+            WeightedTarget {
+                target_api: 1,
+                weight: 0.75,
+            },
+            WeightedTarget {
+                target_api: 2,
+                weight: 0.0,
+            },
+        ];
+
+        let caps = allocate_target_budget_caps(&targets, 10, 5, 2);
+
+        assert_eq!(caps[&0], 4);
+        assert_eq!(caps[&1], 4);
+        assert_eq!(caps[&2], 2);
+    }
+
+    #[test]
+    fn target_budget_allocation_drops_low_weight_targets_when_floor_exceeds_wrapper_cap() {
+        let targets = vec![
+            WeightedTarget {
+                target_api: 0,
+                weight: 0.75,
+            },
+            WeightedTarget {
+                target_api: 1,
+                weight: 0.5,
+            },
+            WeightedTarget {
+                target_api: 2,
+                weight: 0.0,
+            },
+        ];
+
+        let caps = allocate_target_budget_caps(&targets, 4, 8, 2);
+
+        assert_eq!(caps[&0], 2);
+        assert_eq!(caps[&1], 2);
+        assert_eq!(caps[&2], 0);
+    }
+
+    #[test]
+    fn target_budget_allocation_uses_remaining_budget_when_floor_is_unreachable() {
+        let targets = vec![
+            WeightedTarget {
+                target_api: 0,
+                weight: 1.0,
+            },
+            WeightedTarget {
+                target_api: 1,
+                weight: 0.25,
+            },
+        ];
+
+        let caps = allocate_target_budget_caps(&targets, 1, 8, 2);
+
+        assert_eq!(caps[&0], 1);
+        assert_eq!(caps[&1], 0);
     }
 }

@@ -5,41 +5,40 @@ use crate::unsafe_analysis::ApiFieldFactsIndex;
 use rustc_middle::ty::TyCtxt;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SequenceLimitMode {
-    Limited,
-    Unlimited,
+pub enum SequenceRankingMode {
+    Ranked,
+    GenerationOrder,
 }
 
-impl SequenceLimitMode {
+impl SequenceRankingMode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Limited => "sequence-limited",
-            Self::Unlimited => "sequence-unlimited",
+            Self::Ranked => "ranked",
+            Self::GenerationOrder => "generation-order",
         }
     }
 
-    pub(crate) fn from_disable_sequence_limits(disable_sequence_limits: bool) -> Self {
-        if disable_sequence_limits {
-            Self::Unlimited
+    pub(crate) fn from_disable_ranking(disable_ranking: bool) -> Self {
+        if disable_ranking {
+            Self::GenerationOrder
         } else {
-            Self::Limited
+            Self::Ranked
         }
     }
 }
 
 pub fn synthesize_suite<'tcx>(
-    sequence_limit_mode: SequenceLimitMode,
+    sequence_ranking_mode: SequenceRankingMode,
     tcx: TyCtxt<'tcx>,
     graph: &ApiDependencyGraph<'tcx>,
     field_facts_index: &ApiFieldFactsIndex,
     config: &SynthesisConfig,
 ) -> SynthesizedSuite<'tcx> {
-    match sequence_limit_mode {
-        SequenceLimitMode::Limited => {
-            obligation_driven::synthesize_suite(tcx, graph, field_facts_index, config)
-        }
-        SequenceLimitMode::Unlimited => {
-            obligation_driven::synthesize_suite_unlimited(tcx, graph, field_facts_index, config)
-        }
-    }
+    obligation_driven::synthesize_suite(
+        sequence_ranking_mode,
+        tcx,
+        graph,
+        field_facts_index,
+        config,
+    )
 }

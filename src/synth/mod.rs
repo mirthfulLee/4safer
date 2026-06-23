@@ -134,6 +134,7 @@ pub struct CandidateEvaluation {
     pub prefix_distance: f32,
     pub target_to_wrapper_distance: f32,
     pub total_distance: f32,
+    pub priority_score: f32,
     pub reuse_penalty: f32,
     pub queue_priority: f32,
 }
@@ -175,9 +176,10 @@ pub struct TargetSynthesisSummary {
     pub base_materialization_failure: Option<&'static str>,
     pub wrapper_sequence_cap: usize,
     pub wrapper_sequences_accepted: usize,
+    pub wrapper_target_distance: f32,
+    pub wrapper_target_weight: f32,
     pub target_sequence_cap: usize,
     pub target_sequences_accepted: usize,
-    pub basic_sequence_cap: usize,
     pub rejected_candidates_wrapper_sequence_cap: usize,
     pub rejected_candidates_target_sequence_cap: usize,
     pub mutator_rounds: Vec<MutatorRoundSummary>,
@@ -193,7 +195,7 @@ pub struct SynthesizedSuite<'tcx> {
     pub target_summaries: Vec<TargetSynthesisSummary>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 /// Configures synthesis depth and mutator expansion limits.
 pub struct SynthesisConfig {
     pub max_depth: usize,
@@ -201,7 +203,11 @@ pub struct SynthesisConfig {
     pub max_sequences: usize,
     pub max_sequences_per_wrapper: usize,
     pub max_sequences_per_target: usize,
-    pub max_basic_sequences_per_target: usize,
+    pub floor_sequences_per_target: usize,
+    pub wrapper_target_max_distance: f32,
+    pub r_flow: f32,
+    pub w_c: f32,
+    pub w_p: f32,
     pub reuse_penalty_enabled: bool,
     pub depth_penalty_enabled: bool,
 }
@@ -242,15 +248,15 @@ impl<'tcx> ApiDescriptor<'tcx> {
 pub(crate) use api::{
     classify_api_safety, is_supported_callable, render_api_path, render_concrete_args,
 };
-pub use strategy::SequenceLimitMode;
+pub use strategy::SequenceRankingMode;
 
-/// Dispatch obligation-driven sequence synthesis with the selected limit mode.
+/// Dispatch obligation-driven sequence synthesis with the selected ranking mode.
 pub fn synthesize_suite<'tcx>(
-    sequence_limit_mode: SequenceLimitMode,
+    sequence_ranking_mode: SequenceRankingMode,
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     graph: &crate::rapx_graph::ApiDependencyGraph<'tcx>,
     field_facts_index: &crate::unsafe_analysis::ApiFieldFactsIndex,
     config: &SynthesisConfig,
 ) -> SynthesizedSuite<'tcx> {
-    strategy::synthesize_suite(sequence_limit_mode, tcx, graph, field_facts_index, config)
+    strategy::synthesize_suite(sequence_ranking_mode, tcx, graph, field_facts_index, config)
 }
