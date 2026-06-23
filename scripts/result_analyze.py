@@ -69,6 +69,7 @@ def main():
     generation = load_generation_rows(config.generation, config.generation_backend)
     unsoundness = load_unsoundness_index(config, generation)
     outputs = []
+    backend_rows = {}
     for label, backend in config.run_backends.items():
         rows = build_backend_rows(label, backend, generation, unsoundness, config)
         if config.verify:
@@ -76,6 +77,11 @@ def main():
         path = config.out_dir / f"{label}_summary.csv"
         write_csv(path, rows)
         outputs.append(path)
+        backend_rows[label] = rows
+    experiment_rows = build_experiment_rows(generation, backend_rows, unsoundness, config)
+    experiment_path = config.out_dir / "experiment_summary.csv"
+    write_experiment_csv(experiment_path, experiment_rows)
+    outputs.append(experiment_path)
     if config.audit_hidden_unsoundness:
         audit_rows = audit_unsoundness_classification(config, generation)
         write_audit(config.audit_csv or config.out_dir / "unsoundness_classification_audit.csv", audit_rows)
@@ -267,6 +273,8 @@ def load_unsoundness_index(config, generation):
     unique_kind_counts = defaultdict(lambda: defaultdict(set))
     unique_sources = defaultdict(set)
     crashes = defaultdict(int)
+    panics = defaultdict(int)
+    unique_panics = defaultdict(set)
 
     if not config.unsoundness_cases.exists():
         return {
@@ -276,6 +284,8 @@ def load_unsoundness_index(config, generation):
             "unique_kind_counts": unique_kind_counts,
             "unique_sources": unique_sources,
             "crashes": crashes,
+            "panics": panics,
+            "unique_panics": unique_panics,
         }
 
     with config.unsoundness_cases.open(newline="", encoding="utf-8") as handle:
@@ -289,10 +299,13 @@ def load_unsoundness_index(config, generation):
             if should_read_full_case_text(row, kind, text):
                 text = case_text(row, force_full=True)
                 kind = classify_case(text, row.get("classification"), row.get("status"), row.get("exit_code"))
+            target_api = target_api_for_case(row, key, generation, suite_targets)
+            if kind == "panic":
+                panics[(backend, key)] += 1
+                unique_panics[(backend, key)].add(panic_fingerprint(backend, key, target_api, text))
             if kind not in HIGH_CONFIDENCE_UNSOUNDNESS:
                 continue
             source = unsoundness_source(row, key, kind, text)
-            target_api = target_api_for_case(row, key, generation, suite_targets)
             fingerprint = unsoundness_fingerprint(backend, key, kind, target_api, source)
             raw_counts[(backend, key)] += 1
             unique[(backend, key)].add(fingerprint)
@@ -307,6 +320,8 @@ def load_unsoundness_index(config, generation):
         "unique_kind_counts": unique_kind_counts,
         "unique_sources": unique_sources,
         "crashes": crashes,
+        "panics": panics,
+        "unique_panics": unique_panics,
     }
 
 
@@ -591,6 +606,10 @@ def unsoundness_fingerprint(backend, key, kind, target_api, source):
     return (backend, key, target_api)
 
 
+def panic_fingerprint(backend, key, target_api, text):
+    return (backend, key, target_api, normalized_error_message(text))
+
+
 def build_backend_rows(label, backend, generation, unsoundness, config):
     result_rows = load_result_rows(backend, config)
     rows = []
@@ -634,6 +653,8 @@ def summary_row(label, backend, key, gen, result, unsoundness):
         "crashes": unsoundness["crashes"][(backend, key)],
         "alarms": unsoundness["raw_counts"][(backend, key)],
         "unique_alarms": len(unsoundness["unique"][(backend, key)]),
+        "panics": unsoundness["panics"][(backend, key)],
+        "unique_panics": len(unsoundness["unique_panics"][(backend, key)]),
         "unsoundness": len(unsoundness["unique"][(backend, key)]),
         "unsoundness_kinds": format_kind_counts(unsoundness["unique_kind_counts"][(backend, key)]),
         "unsoundness_sources": format_sources(unsoundness["unique_sources"][(backend, key)]),
@@ -666,6 +687,8 @@ def total_row(label, backend, rows):
         "crashes": sum(inum(row["crashes"]) for row in rows),
         "alarms": sum(inum(row["alarms"]) for row in rows),
         "unique_alarms": sum(inum(row["unique_alarms"]) for row in rows),
+        "panics": sum(inum(row["panics"]) for row in rows),
+        "unique_panics": sum(inum(row["unique_panics"]) for row in rows),
         "unsoundness": sum(inum(row["unsoundness"]) for row in rows),
         "unsoundness_kinds": merge_kind_count_column(rows, "unsoundness_kinds"),
         "unsoundness_sources": merge_sources(rows),
@@ -676,6 +699,143 @@ def total_row(label, backend, rows):
         "first_error": "",
     }
     return total
+
+
+def build_experiment_rows(generation, backend_rows, unsoundness, config):
+    result_rows_by_label = {
+        label: load_result_rows(backend, config)
+        for label, backend in config.run_backends.items()
+    }
+    rows_by_label = {
+        label: {row["crate_key"]: row for row in rows if row.get("crate_key") != "total"}
+        for label, rows in backend_rows.items()
+    }
+    rows = []
+    for key in sorted(generation, key=crate_sort_key):
+        gen = generation[key]
+        row = {
+            "crate": gen.get("crate"),
+            "version": gen.get("version"),
+            "crate_key": key,
+            "suites": 0,
+            "planner_sequences": inum(gen.get("sequence_count")),
+            "synthesis_time_sec": fnum(gen.get("elapsed_sec")),
+            "passed": 0,
+            "failed": 0,
+            "timeout": 0,
+            "alarms": 0,
+            "unique_alarms": 0,
+            "panics": 0,
+            "unique_panics": 0,
+            "unsoundness": combined_unsoundness_count(unsoundness, config.run_backends.values(), key),
+            "time_sec": fnum(gen.get("elapsed_sec")),
+        }
+        status_parts = []
+        for label, backend in config.run_backends.items():
+            backend_summary = rows_by_label.get(label, {}).get(key, {})
+            result = result_rows_by_label.get(label, {}).get(key, {})
+            prefix = sanitize_column_prefix(label)
+            status = backend_summary.get("execution_status") or result.get("status") or "missing"
+            row[f"{prefix}_status"] = status
+            row[f"{prefix}_suites"] = inum(result.get("selected_generated_tests")) or inum(
+                backend_summary.get("selected_suites")
+            )
+            row["suites"] = max(row["suites"], row[f"{prefix}_suites"])
+            row[f"{prefix}_passed"] = inum(result.get("tests_passed"))
+            row[f"{prefix}_failed"] = inum(result.get("tests_failed"))
+            row[f"{prefix}_timeout"] = inum(result.get("tests_timeout"))
+            row[f"{prefix}_alarms"] = unsoundness["raw_counts"][(backend, key)]
+            row[f"{prefix}_unique_alarms"] = len(unsoundness["unique"][(backend, key)])
+            row[f"{prefix}_panics"] = unsoundness["panics"][(backend, key)]
+            row[f"{prefix}_unique_panics"] = len(unsoundness["unique_panics"][(backend, key)])
+            row[f"{prefix}_unsoundness"] = len(unsoundness["unique"][(backend, key)])
+            row[f"{prefix}_time_sec"] = fnum(result.get("elapsed_sec"))
+            row[f"{prefix}_first_error"] = result.get("first_error") or ""
+
+            status_parts.append(f"{prefix}={status}")
+            row["passed"] += row[f"{prefix}_passed"]
+            row["failed"] += row[f"{prefix}_failed"]
+            row["timeout"] += row[f"{prefix}_timeout"]
+            row["alarms"] += row[f"{prefix}_alarms"]
+            row["unique_alarms"] += row[f"{prefix}_unique_alarms"]
+            row["panics"] += row[f"{prefix}_panics"]
+            row["unique_panics"] += row[f"{prefix}_unique_panics"]
+            row["time_sec"] += row[f"{prefix}_time_sec"]
+        row["status"] = ";".join(status_parts)
+        row["time_sec"] = round(row["time_sec"], 3)
+        row["synthesis_time_sec"] = round(row["synthesis_time_sec"], 3)
+        rows.append(row)
+    rows.append(total_experiment_row(rows, config))
+    return rows
+
+
+def combined_unsoundness_count(unsoundness, backends, key):
+    unique_targets = set()
+    for backend in backends:
+        for fingerprint in unsoundness["unique"][(backend, key)]:
+            unique_targets.add(combined_unsoundness_fingerprint(fingerprint))
+    return len(unique_targets)
+
+
+def combined_unsoundness_fingerprint(fingerprint):
+    if isinstance(fingerprint, tuple) and len(fingerprint) >= 3:
+        return fingerprint[2]
+    return fingerprint
+
+
+def total_experiment_row(rows, config):
+    total = {
+        "crate": "total",
+        "version": "",
+        "crate_key": "total",
+        "status": format_experiment_status_counts(rows, config),
+        "suites": sum(inum(row["suites"]) for row in rows),
+        "planner_sequences": sum(inum(row["planner_sequences"]) for row in rows),
+        "synthesis_time_sec": round(sum(fnum(row["synthesis_time_sec"]) for row in rows), 3),
+        "passed": sum(inum(row["passed"]) for row in rows),
+        "failed": sum(inum(row["failed"]) for row in rows),
+        "timeout": sum(inum(row["timeout"]) for row in rows),
+        "alarms": sum(inum(row["alarms"]) for row in rows),
+        "unique_alarms": sum(inum(row["unique_alarms"]) for row in rows),
+        "panics": sum(inum(row["panics"]) for row in rows),
+        "unique_panics": sum(inum(row["unique_panics"]) for row in rows),
+        "unsoundness": sum(inum(row["unsoundness"]) for row in rows),
+        "time_sec": round(sum(fnum(row["time_sec"]) for row in rows), 3),
+    }
+    for label in config.run_backends:
+        prefix = sanitize_column_prefix(label)
+        total[f"{prefix}_status"] = format_backend_status_counts(rows, prefix)
+        total[f"{prefix}_suites"] = sum(inum(row.get(f"{prefix}_suites")) for row in rows)
+        total[f"{prefix}_passed"] = sum(inum(row.get(f"{prefix}_passed")) for row in rows)
+        total[f"{prefix}_failed"] = sum(inum(row.get(f"{prefix}_failed")) for row in rows)
+        total[f"{prefix}_timeout"] = sum(inum(row.get(f"{prefix}_timeout")) for row in rows)
+        total[f"{prefix}_alarms"] = sum(inum(row.get(f"{prefix}_alarms")) for row in rows)
+        total[f"{prefix}_unique_alarms"] = sum(inum(row.get(f"{prefix}_unique_alarms")) for row in rows)
+        total[f"{prefix}_panics"] = sum(inum(row.get(f"{prefix}_panics")) for row in rows)
+        total[f"{prefix}_unique_panics"] = sum(inum(row.get(f"{prefix}_unique_panics")) for row in rows)
+        total[f"{prefix}_unsoundness"] = sum(inum(row.get(f"{prefix}_unsoundness")) for row in rows)
+        total[f"{prefix}_time_sec"] = round(sum(fnum(row.get(f"{prefix}_time_sec")) for row in rows), 3)
+        total[f"{prefix}_first_error"] = ""
+    return total
+
+
+def sanitize_column_prefix(label):
+    return re.sub(r"[^A-Za-z0-9]+", "_", label).strip("_")
+
+
+def format_experiment_status_counts(rows, config):
+    parts = []
+    for label in config.run_backends:
+        prefix = sanitize_column_prefix(label)
+        parts.append(f"{prefix}: {format_backend_status_counts(rows, prefix)}")
+    return "; ".join(parts)
+
+
+def format_backend_status_counts(rows, prefix):
+    counts = defaultdict(int)
+    for row in rows:
+        counts[row.get(f"{prefix}_status") or "missing"] += 1
+    return ",".join(f"{key}={counts[key]}" for key in sorted(counts))
 
 
 def verify_backend_rows(label, backend, rows, generation, config):
@@ -698,6 +858,8 @@ def verify_backend_rows(label, backend, rows, generation, config):
         "crashes",
         "alarms",
         "unique_alarms",
+        "panics",
+        "unique_panics",
         "unsoundness",
     ]
     errors = []
@@ -875,6 +1037,8 @@ def write_csv(path, rows):
         "crashes",
         "alarms",
         "unique_alarms",
+        "panics",
+        "unique_panics",
         "unsoundness",
         "unsoundness_kinds",
         "unsoundness_sources",
@@ -888,6 +1052,69 @@ def write_csv(path, rows):
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def write_experiment_csv(path, rows):
+    fields = [
+        "crate",
+        "version",
+        "crate_key",
+        "status",
+        "suites",
+        "planner_sequences",
+        "passed",
+        "failed",
+        "timeout",
+        "alarms",
+        "unique_alarms",
+        "panics",
+        "unique_panics",
+        "unsoundness",
+        "synthesis_time_sec",
+        "time_sec",
+    ]
+    backend_fields = []
+    for row in rows:
+        for key in row:
+            if key in fields or key in backend_fields:
+                continue
+            if key.endswith("_first_error"):
+                continue
+            backend_fields.append(key)
+    ordered_backend_fields = sorted(
+        backend_fields,
+        key=lambda field: (
+            field.split("_", 1)[0],
+            backend_field_order(field),
+            field,
+        ),
+    )
+    fields.extend(ordered_backend_fields)
+    fields.extend(sorted({key for row in rows for key in row if key.endswith("_first_error")}))
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def backend_field_order(field):
+    suffix_order = [
+        "_status",
+        "_suites",
+        "_passed",
+        "_failed",
+        "_timeout",
+        "_alarms",
+        "_unique_alarms",
+        "_panics",
+        "_unique_panics",
+        "_unsoundness",
+        "_time_sec",
+    ]
+    for index, suffix in enumerate(suffix_order):
+        if field.endswith(suffix):
+            return index
+    return len(suffix_order)
 
 
 def write_audit(path, rows):
