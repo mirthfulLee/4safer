@@ -60,8 +60,8 @@ pub struct ApiFieldFacts {
     pub mutated_inputs: Vec<FieldSet>,
     pub contract_inputs: Vec<FieldSet>,
     pub contract_output: FieldSet,
-    pub obligation_inputs: Vec<FieldSet>,
-    pub obligation_input_distances: Vec<FieldDistanceMap>,
+    pub unsafe_relevance_inputs: Vec<FieldSet>,
+    pub unsafe_relevance_input_distances: Vec<FieldDistanceMap>,
     pub unsafe_inputs: Vec<FieldSet>,
     #[allow(dead_code)]
     pub unsafe_output: FieldSet,
@@ -132,8 +132,8 @@ struct FunctionFieldFacts {
     mutated_inputs: Vec<FieldSet>,
     contract_inputs: Vec<FieldSet>,
     contract_output: FieldSet,
-    obligation_inputs: Vec<FieldSet>,
-    obligation_input_distances: Vec<FieldDistanceMap>,
+    unsafe_relevance_inputs: Vec<FieldSet>,
+    unsafe_relevance_input_distances: Vec<FieldDistanceMap>,
     unsafe_inputs: Vec<FieldSet>,
     unsafe_output: FieldSet,
     unsafe_functions: Vec<String>,
@@ -237,8 +237,8 @@ pub fn analyze_public_unsafe_surfaces<'tcx>(tcx: TyCtxt<'tcx>) -> ApiFieldFactsI
                     mutated_inputs: field_facts.mutated_inputs,
                     contract_inputs: field_facts.contract_inputs,
                     contract_output: field_facts.contract_output,
-                    obligation_inputs: field_facts.obligation_inputs,
-                    obligation_input_distances: field_facts.obligation_input_distances,
+                    unsafe_relevance_inputs: field_facts.unsafe_relevance_inputs,
+                    unsafe_relevance_input_distances: field_facts.unsafe_relevance_input_distances,
                     unsafe_inputs: field_facts.unsafe_inputs,
                     unsafe_output: field_facts.unsafe_output,
                     unsafe_functions: field_facts.unsafe_functions,
@@ -293,7 +293,7 @@ fn derive_function_facts<'tcx>(
     collector.visit_body(body);
     collector.facts.transfers = build_field_transfers(body, &origins, callee_summaries, tcx);
 
-    // Phase 2: unsafe obligation extraction.
+    // Phase 2: unsafe-relevance field extraction.
     let unsafe_spans = explicit_unsafe_block_spans(def_id, tcx);
     let (contract_inputs, contract_output) =
         derive_contract_summary(body, &origins, callee_summaries, &unsafe_spans, tcx);
@@ -310,10 +310,10 @@ fn derive_function_facts<'tcx>(
         callee_summaries,
         tcx,
     );
-    let (obligation_inputs, obligation_input_distances) =
-        derive_obligation_inputs(&collector.facts.transfers, &collector.facts, input_count);
-    collector.facts.obligation_inputs = obligation_inputs;
-    collector.facts.obligation_input_distances = obligation_input_distances;
+    let (unsafe_relevance_inputs, unsafe_relevance_input_distances) =
+        derive_unsafe_relevance_inputs(&collector.facts.transfers, &collector.facts, input_count);
+    collector.facts.unsafe_relevance_inputs = unsafe_relevance_inputs;
+    collector.facts.unsafe_relevance_input_distances = unsafe_relevance_input_distances;
     collector.facts.has_transitive_unsafe = has_transitive_unsafe || direct_unsafe;
     normalize_field_facts(&mut collector.facts);
     collector.facts
@@ -327,8 +327,8 @@ impl FunctionFieldFacts {
             mutated_inputs: vec![FieldSet::new(); input_count],
             contract_inputs: vec![FieldSet::new(); input_count],
             contract_output: FieldSet::new(),
-            obligation_inputs: vec![FieldSet::new(); input_count],
-            obligation_input_distances: vec![FieldDistanceMap::new(); input_count],
+            unsafe_relevance_inputs: vec![FieldSet::new(); input_count],
+            unsafe_relevance_input_distances: vec![FieldDistanceMap::new(); input_count],
             unsafe_inputs: vec![FieldSet::new(); input_count],
             unsafe_output: FieldSet::new(),
             unsafe_functions: Vec::new(),
@@ -585,7 +585,7 @@ fn normalize_field_facts(facts: &mut FunctionFieldFacts) {
         normalize_field_set(fields);
     }
     normalize_field_set(&mut facts.contract_output);
-    for fields in &mut facts.obligation_inputs {
+    for fields in &mut facts.unsafe_relevance_inputs {
         normalize_field_set(fields);
     }
     for fields in &mut facts.unsafe_inputs {
@@ -712,12 +712,12 @@ fn to_transfer_point(origin: &InterfacePlace) -> TransferPoint {
     }
 }
 
-fn derive_obligation_inputs(
+fn derive_unsafe_relevance_inputs(
     transfers: &[FieldTransfer],
     field_facts: &FunctionFieldFacts,
     input_count: usize,
 ) -> (Vec<FieldSet>, Vec<FieldDistanceMap>) {
-    let mut obligations = vec![FieldSet::new(); input_count];
+    let mut unsafe_relevance_inputs = vec![FieldSet::new(); input_count];
     let mut distances = vec![FieldDistanceMap::new(); input_count];
 
     for transfer in transfers {
@@ -740,7 +740,7 @@ fn derive_obligation_inputs(
                 .any(|field| paths_overlap(field, &transfer.dst.path)),
         };
         if relevant_dst {
-            obligations[src_index].insert(transfer.src.path.clone());
+            unsafe_relevance_inputs[src_index].insert(transfer.src.path.clone());
             update_min_distance(
                 distances
                     .get_mut(src_index)
@@ -751,7 +751,7 @@ fn derive_obligation_inputs(
         }
     }
 
-    (obligations, distances)
+    (unsafe_relevance_inputs, distances)
 }
 
 fn update_min_distance(map: &mut FieldDistanceMap, path: FieldPath, distance: u32) {
@@ -2096,7 +2096,7 @@ impl<'hir> Visitor<'hir> for ExplicitUnsafeSpanCollector {
 }
 
 /// MIR visitor that accumulates field-sensitive dataflow facts before
-/// obligation extraction.
+/// unsafe-relevance extraction.
 struct DataflowFactsCollector<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,

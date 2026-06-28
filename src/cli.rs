@@ -34,7 +34,7 @@ impl LogLevel {
 enum CargoCli {
     #[command(
         name = "4safer",
-        about = "Synthesize obligation-driven test suites for a Rust library crate",
+        about = "Synthesize unsafe-flow-guided test suites for a Rust library crate",
         after_help = "Examples:\n  cargo 4safer -C /path/to/crate\n  cargo 4safer -m /path/to/crate/Cargo.toml\n  cargo 4safer -C /path/to/workspace -p my-lib\n  cargo 4safer -C /path/to/crate -o /tmp/my-suite -c\n\nPass extra `cargo check` flags after `--`, for example:\n  cargo 4safer -C /path/to/crate -- --features extra"
     )]
     FourSafer(FourSaferArgs),
@@ -129,7 +129,7 @@ pub struct FourSaferArgs {
         display_order = 17
     )]
     pub max_sequences_per_wrapper: usize,
-    /// Maximum synthesized sequences per obligation target; 0 means unlimited.
+    /// Maximum synthesized sequences per unsafe-flow target; 0 means unlimited.
     #[arg(
         long = "max-sequences-per-target",
         value_name = "COUNT",
@@ -138,7 +138,7 @@ pub struct FourSaferArgs {
         display_order = 18
     )]
     pub max_sequences_per_target: usize,
-    /// Floor sequence budget for one target with multiple obligated parameters.
+    /// Floor sequence budget for one target with multiple unsafe-flow parameters.
     #[arg(
         long = "floor-sequences-per-target",
         value_name = "COUNT",
@@ -190,7 +190,7 @@ pub struct FourSaferArgs {
         display_order = 23
     )]
     pub w_p: f32,
-    /// Disable mutator reuse penalty when ordering obligation-driven actions.
+    /// Disable mutator reuse penalty when ordering unsafe-flow-guided actions.
     #[arg(
         long = "disable-reuse-penalty",
         help_heading = "Core Options",

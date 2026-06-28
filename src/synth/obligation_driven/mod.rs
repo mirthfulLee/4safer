@@ -12,10 +12,10 @@ pub(super) fn synthesize_suite<'tcx>(
     field_facts_index: &ApiFieldFactsIndex,
     config: &SynthesisConfig,
 ) -> SynthesizedSuite<'tcx> {
-    // The planner embodies the obligation-driven pipeline:
+    // The planner embodies the unsafe-flow-guided pipeline:
     // 1. field-sensitive facts are consumed through `field_facts_index`,
-    // 2. unsafe obligations are reflected in target/parameter selection,
-    // 3. target-focused call sequences are synthesized under those obligations.
+    // 2. unsafe-relevance fields guide target/parameter selection,
+    // 3. target-focused call sequences are synthesized from unsafe-flow entries.
     planner::Planner::new(
         tcx,
         graph,

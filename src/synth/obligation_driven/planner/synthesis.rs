@@ -3,8 +3,8 @@ use super::*;
 struct TargetQueueState {
     target_api: usize,
     unsafe_wrapper: String,
-    obligated_params: Vec<usize>,
-    has_explicit_obligations: bool,
+    unsafe_flow_params: Vec<usize>,
+    has_explicit_unsafe_flow_entries: bool,
     base_sequences_before_cap: usize,
     base_materialization_failure: Option<&'static str>,
     seen_signatures: HashSet<u64>,
@@ -42,11 +42,11 @@ const UNLIMITED_TARGET_SEQUENCE_CAP: usize = usize::MAX;
 
 struct MutatorInsertion<'a> {
     call_index: usize,
-    obligation_param_index: usize,
+    unsafe_flow_param_index: usize,
     receiver_source: ValueSource,
     mutator_api: usize,
     mutated_param_index: usize,
-    selected_obligation_fields: &'a FieldSet,
+    selected_unsafe_flow_fields: &'a FieldSet,
     plan: &'a CallPlan,
     prefix_distance: f32,
     target_distance: f32,
@@ -775,8 +775,8 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             summaries.push(TargetSynthesisSummary {
                 target_api: state.target_api,
                 unsafe_wrapper: state.unsafe_wrapper,
-                obligated_params: state.obligated_params,
-                has_explicit_obligations: state.has_explicit_obligations,
+                unsafe_flow_params: state.unsafe_flow_params,
+                has_explicit_unsafe_flow_entries: state.has_explicit_unsafe_flow_entries,
                 base_sequences_before_cap: state.base_sequences_before_cap,
                 base_sequences_after_cap: state
                     .accepted_sequences
@@ -817,15 +817,17 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         unsafe_wrapper: &str,
         target_sequence_cap: usize,
     ) -> Option<TargetQueueState> {
-        let obligated_param_selection = select_obligated_params(&self.apis[target_api]);
-        if obligated_param_selection.params.is_empty() && !self.apis[target_api].inputs.is_empty() {
+        let unsafe_flow_param_selection = select_unsafe_flow_params(&self.apis[target_api]);
+        if unsafe_flow_param_selection.params.is_empty() && !self.apis[target_api].inputs.is_empty()
+        {
             return Some(TargetQueueState {
                 target_api,
                 unsafe_wrapper: unsafe_wrapper.to_owned(),
-                obligated_params: Vec::new(),
-                has_explicit_obligations: obligated_param_selection.has_explicit_obligations,
+                unsafe_flow_params: Vec::new(),
+                has_explicit_unsafe_flow_entries: unsafe_flow_param_selection
+                    .has_explicit_unsafe_flow_entries,
                 base_sequences_before_cap: 0,
-                base_materialization_failure: Some("no_obligated_params"),
+                base_materialization_failure: Some("no_unsafe_flow_params"),
                 seen_signatures: HashSet::new(),
                 queue: Vec::new(),
                 accepted_sequences: Vec::new(),
@@ -841,7 +843,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 depth_penalty_enabled: self.depth_penalty_enabled,
                 rejected_candidates_wrapper_sequence_cap: 0,
                 rejected_candidates_target_sequence_cap: 0,
-                stop_reason: Some("no_obligated_params"),
+                stop_reason: Some("no_unsafe_flow_params"),
             });
         }
 
@@ -850,15 +852,16 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             .synthesize_base_target_sequences(
                 target_api,
                 unsafe_wrapper,
-                &obligated_param_selection,
+                &unsafe_flow_param_selection,
                 &mut seen_signatures,
             );
 
         Some(TargetQueueState {
             target_api,
             unsafe_wrapper: unsafe_wrapper.to_owned(),
-            obligated_params: obligated_param_selection.params,
-            has_explicit_obligations: obligated_param_selection.has_explicit_obligations,
+            unsafe_flow_params: unsafe_flow_param_selection.params,
+            has_explicit_unsafe_flow_entries: unsafe_flow_param_selection
+                .has_explicit_unsafe_flow_entries,
             base_sequences_before_cap,
             base_materialization_failure,
             seen_signatures,
@@ -886,25 +889,25 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         &mut self,
         target_api: usize,
         unsafe_wrapper: &str,
-        obligated_param_selection: &ObligatedParamSelection,
+        unsafe_flow_param_selection: &UnsafeFlowParamSelection,
         seen_signatures: &mut HashSet<u64>,
     ) -> (Vec<SequenceCandidate>, usize, Option<&'static str>) {
         let materialized = self.materialize_target_suites(
             target_api,
             &[basic_target_candidate(
                 target_api,
-                &obligated_param_selection.params,
+                &unsafe_flow_param_selection.params,
                 &self.apis,
             )],
-            obligated_param_selection.has_explicit_obligations,
+            unsafe_flow_param_selection.has_explicit_unsafe_flow_entries,
         );
         let basic_sequences = materialized.sequences;
         let base_sequences_before_cap = basic_sequences.len();
         debug!(
             target: "foursafer::planner",
-            "target `{}` obligated_params={:?} basic_sequences={}",
+            "target `{}` unsafe_flow_params={:?} basic_sequences={}",
             self.apis[target_api].path,
-            obligated_param_selection.params,
+            unsafe_flow_param_selection.params,
             basic_sequences.len()
         );
 
@@ -984,7 +987,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
     }
 
     fn expand_with_mutators(&mut self, base: &SequencePlan) -> MutatorExpansionResult {
-        let obligations = self.sequence_obligations(base);
+        let pending_entries = self.pending_unsafe_flow_entries(base);
         let candidate_limit = self.sequence_generation_limit();
         let mut candidates = Vec::new();
         let mut depth_pruned_candidates = 0usize;
@@ -998,17 +1001,17 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 let Some(input) = inputs.get(param_index) else {
                     continue;
                 };
-                let obligation = obligations
+                let unsafe_flow_entries = pending_entries
                     .get(call_index)
                     .and_then(|params| params.get(param_index))
                     .cloned()
                     .unwrap_or_default();
-                if obligation.is_empty() {
+                if unsafe_flow_entries.is_empty() {
                     continue;
                 }
 
                 let Some(mutator_candidates) =
-                    self.mutators.get(&obligated_state_ty(*input)).cloned()
+                    self.mutators.get(&unsafe_flow_state_ty(*input)).cloned()
                 else {
                     continue;
                 };
@@ -1020,15 +1023,15 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                                 &self.apis[*mutator_api],
                                 *mutated_param_index,
                             )),
-                            &obligation,
+                            &unsafe_flow_entries,
                         )
                     })
                     .collect::<Vec<_>>();
-                let call_distance = distance_to_selected_obligation_site(base, call_index);
+                let call_distance = distance_to_selected_unsafe_flow_site(base, call_index);
                 let target_distance = average_distance_for_required_fields(
                     &self.apis[call.api_index],
                     param_index,
-                    &obligation,
+                    &unsafe_flow_entries,
                 )
                 .unwrap_or(call_distance as f32);
                 if self.ranking_enabled {
@@ -1039,7 +1042,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                             base,
                             left.0,
                             &left_provided,
-                            &obligation,
+                            &unsafe_flow_entries,
                             call_distance,
                             target_distance,
                             &self.tuning,
@@ -1048,7 +1051,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                             base,
                             right.0,
                             &right_provided,
-                            &obligation,
+                            &unsafe_flow_entries,
                             call_distance,
                             target_distance,
                             &self.tuning,
@@ -1066,11 +1069,11 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 mutator_candidates.truncate(self.tuning.max_mutator_candidates_per_param);
                 debug!(
                     target: "foursafer::planner",
-                    "mutator screening: target=`{}` call=`{}` param={} obligation={:?} receiver_source={:?} matching_candidates={}",
+                    "mutator screening: target=`{}` call=`{}` param={} unsafe_flow_entries={:?} receiver_source={:?} matching_candidates={}",
                     self.apis[base.target_api].path,
                     self.apis[call.api_index].path,
                     param_index,
-                    obligation,
+                    unsafe_flow_entries,
                     arg.source,
                     mutator_candidates.len()
                 );
@@ -1080,12 +1083,12 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                         call_provided_fields(&self.apis[mutator_api], mutated_param_index);
                     debug!(
                         target: "foursafer::planner",
-                        "mutator candidate accepted: target=`{}` mutator=`{}` mutator_param={} provided={:?} obligation={:?}",
+                        "mutator candidate accepted: target=`{}` mutator=`{}` mutator_param={} provided={:?} unsafe_flow_entries={:?}",
                         self.apis[base.target_api].path,
                         self.apis[mutator_api].path,
                         mutated_param_index,
                         provided,
-                        obligation
+                        unsafe_flow_entries
                     );
                     let Some(plans) = self.build_call_plans(mutator_api, mutated_param_index)
                     else {
@@ -1094,11 +1097,11 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                     for plan in &plans {
                         let insertion = MutatorInsertion {
                             call_index,
-                            obligation_param_index: param_index,
+                            unsafe_flow_param_index: param_index,
                             receiver_source: arg.source.clone(),
                             mutator_api,
                             mutated_param_index,
-                            selected_obligation_fields: &obligation,
+                            selected_unsafe_flow_fields: &unsafe_flow_entries,
                             plan,
                             prefix_distance: call_distance.saturating_add(1) as f32,
                             target_distance,
@@ -1110,11 +1113,11 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                         };
                         debug!(
                             target: "foursafer::planner",
-                            "mutator inserted: target=`{}` mutator=`{}` before_call=`{}` obligation={:?} plan_prefix_steps={}",
+                            "mutator inserted: target=`{}` mutator=`{}` before_call=`{}` unsafe_flow_entries={:?} plan_prefix_steps={}",
                             self.apis[base.target_api].path,
                             self.apis[mutator_api].path,
                             self.apis[call.api_index].path,
-                            obligation,
+                            unsafe_flow_entries,
                             plan.prefix.len()
                         );
                         candidates.push(candidate);
@@ -1132,9 +1135,9 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         }
     }
 
-    fn sequence_obligations(&self, sequence: &SequencePlan) -> Vec<Vec<FieldSet>> {
-        let mut source_obligations: HashMap<ValueSource, FieldSet> = HashMap::new();
-        let mut obligations = sequence
+    fn pending_unsafe_flow_entries(&self, sequence: &SequencePlan) -> Vec<Vec<FieldSet>> {
+        let mut source_pending_entries: HashMap<ValueSource, FieldSet> = HashMap::new();
+        let mut pending_entries = sequence
             .steps
             .iter()
             .map(|step| vec![FieldSet::new(); self.apis[step.api_index].inputs.len()])
@@ -1146,17 +1149,21 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
 
             if step_index == sequence.target_step {
                 for (param_index, arg) in step.args.iter().enumerate() {
-                    let needed = initial_target_obligations(api, param_index);
+                    let needed = initial_target_unsafe_flow_entries(api, param_index);
                     if needed.is_empty() {
                         continue;
                     }
-                    obligations[step_index][param_index].extend(needed.clone());
-                    extend_source_obligation(&mut source_obligations, &arg.source, needed);
+                    pending_entries[step_index][param_index].extend(needed.clone());
+                    extend_source_unsafe_flow_entries(
+                        &mut source_pending_entries,
+                        &arg.source,
+                        needed,
+                    );
                 }
             }
 
             let output_source = ValueSource::Step(step_index);
-            let output_needed = source_obligations
+            let output_needed = source_pending_entries
                 .remove(&output_source)
                 .unwrap_or_default();
             if !output_needed.is_empty() {
@@ -1165,8 +1172,12 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                     if required.is_empty() {
                         continue;
                     }
-                    obligations[step_index][param_index].extend(required.clone());
-                    extend_source_obligation(&mut source_obligations, &arg.source, required);
+                    pending_entries[step_index][param_index].extend(required.clone());
+                    extend_source_unsafe_flow_entries(
+                        &mut source_pending_entries,
+                        &arg.source,
+                        required,
+                    );
                 }
             }
 
@@ -1174,7 +1185,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 let TyKind::Ref(_, _, ty::Mutability::Mut) = api.inputs[param_index].kind() else {
                     continue;
                 };
-                let current_needed = source_obligations
+                let current_needed = source_pending_entries
                     .get(&arg.source)
                     .cloned()
                     .unwrap_or_default();
@@ -1189,8 +1200,8 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                     ALLOW_REQUIRED_PROVIDED_OVERLAP,
                 );
                 before.extend(call_required_fields(api, param_index));
-                obligations[step_index][param_index].extend(before.clone());
-                source_obligations.insert(arg.source.clone(), before);
+                pending_entries[step_index][param_index].extend(before.clone());
+                source_pending_entries.insert(arg.source.clone(), before);
 
                 if field_sets_overlap(Some(&provided), &current_needed) {
                     for (other_index, other_arg) in step.args.iter().enumerate() {
@@ -1202,9 +1213,9 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                         if required.is_empty() {
                             continue;
                         }
-                        obligations[step_index][other_index].extend(required.clone());
-                        extend_source_obligation(
-                            &mut source_obligations,
+                        pending_entries[step_index][other_index].extend(required.clone());
+                        extend_source_unsafe_flow_entries(
+                            &mut source_pending_entries,
                             &other_arg.source,
                             required,
                         );
@@ -1213,7 +1224,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             }
         }
 
-        obligations
+        pending_entries
     }
 
     fn insert_mutator_before_call(
@@ -1266,7 +1277,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         let target_to_wrapper_distance = insertion.target_distance;
         let total_distance = insertion.prefix_distance + target_to_wrapper_distance;
         let flow_score = flow_score_for_parts(
-            insertion.selected_obligation_fields.len(),
+            insertion.selected_unsafe_flow_fields.len(),
             insertion.prefix_distance,
             target_to_wrapper_distance,
             &self.tuning,
@@ -1295,9 +1306,9 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 successor: Vec::new(),
                 latest_call,
                 mutated_param: Some(insertion.mutated_param_index),
-                selected_obligation_call: Some(call_index + inserted_count),
-                selected_obligation_param: Some(insertion.obligation_param_index),
-                selected_obligation_fields: insertion.selected_obligation_fields.clone(),
+                selected_unsafe_flow_call: Some(call_index + inserted_count),
+                selected_unsafe_flow_param: Some(insertion.unsafe_flow_param_index),
+                selected_unsafe_flow_fields: insertion.selected_unsafe_flow_fields.clone(),
                 ranking_value,
                 construction_cost,
                 prefix_distance: insertion.prefix_distance,
@@ -1339,9 +1350,9 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 successor: Vec::new(),
                 latest_call: steps.len().saturating_sub(1),
                 mutated_param,
-                selected_obligation_call: None,
-                selected_obligation_param: None,
-                selected_obligation_fields: FieldSet::new(),
+                selected_unsafe_flow_call: None,
+                selected_unsafe_flow_param: None,
+                selected_unsafe_flow_fields: FieldSet::new(),
                 ranking_value,
                 construction_cost,
                 prefix_distance,
@@ -1354,16 +1365,16 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         }
     }
 
-    fn materialize_obligated_param_candidate(
+    fn materialize_unsafe_flow_param_candidate(
         &mut self,
         target_api: usize,
-        candidate: &ObligatedParamCandidatePath,
-    ) -> Vec<ObligatedParamSteps> {
+        candidate: &UnsafeFlowParamCandidatePath,
+    ) -> Vec<UnsafeFlowParamSteps> {
         let target = &self.apis[target_api];
-        let obligated_param = candidate.obligated_param;
-        let obligated_input = target.inputs[obligated_param];
-        let constructor_candidates = self.constructor_candidates_for_obligated_param(
-            obligated_input,
+        let unsafe_flow_param = candidate.unsafe_flow_param;
+        let unsafe_flow_input = target.inputs[unsafe_flow_param];
+        let constructor_candidates = self.constructor_candidates_for_unsafe_flow_param(
+            unsafe_flow_input,
             &candidate.remaining_needed,
         );
 
@@ -1373,9 +1384,9 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             let constructor_steps =
                 self.basic_sequences_ended_with_constructor(constructor, &mut Vec::new());
             for base_steps in constructor_steps {
-                base_variants.push(ObligatedParamSteps {
-                    obligated_param,
-                    obligated_source: ValueSource::Step(base_steps.len().saturating_sub(1)),
+                base_variants.push(UnsafeFlowParamSteps {
+                    unsafe_flow_param,
+                    unsafe_flow_source: ValueSource::Step(base_steps.len().saturating_sub(1)),
                     steps: base_steps,
                     mutator_count: 0,
                     materialization_cost: 0.0,
@@ -1386,44 +1397,46 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             }
         }
         let has_materialized_constructor_path = !base_variants.is_empty();
-        if (supports_direct_symbolic_input(self.tcx, obligated_input)
-            || is_pyo3_python_token_input(self.tcx, obligated_input))
+        if (supports_direct_symbolic_input(self.tcx, unsafe_flow_input)
+            || is_pyo3_python_token_input(self.tcx, unsafe_flow_input))
             && !prefers_constructor_materialization_for_direct_target(
                 &self.apis[target_api],
-                obligated_input,
+                unsafe_flow_input,
                 has_materialized_constructor_path,
             )
         {
-            base_variants.push(ObligatedParamSteps {
-                obligated_param,
+            base_variants.push(UnsafeFlowParamSteps {
+                unsafe_flow_param,
                 steps: Vec::new(),
-                obligated_source: ValueSource::Param(0),
+                unsafe_flow_source: ValueSource::Param(0),
                 mutator_count: 0,
                 materialization_cost: 0.0,
             });
         }
-        let mut obligated_steps = dedupe_obligated_param_steps(base_variants);
+        let mut unsafe_flow_steps = dedupe_unsafe_flow_param_steps(base_variants);
         let limit =
-            sequence_limit.unwrap_or(self.tuning.max_materialized_variants_per_obligated_param);
+            sequence_limit.unwrap_or(self.tuning.max_materialized_variants_per_unsafe_flow_param);
         if self.ranking_enabled {
-            rank_and_truncate_obligated_param_steps(&mut obligated_steps, limit);
+            rank_and_truncate_unsafe_flow_param_steps(&mut unsafe_flow_steps, limit);
         } else {
-            obligated_steps.truncate(limit);
+            unsafe_flow_steps.truncate(limit);
         }
-        obligated_steps
+        unsafe_flow_steps
     }
 
-    fn constructor_candidates_for_obligated_param(
+    fn constructor_candidates_for_unsafe_flow_param(
         &mut self,
-        obligated_input: Ty<'tcx>,
+        unsafe_flow_input: Ty<'tcx>,
         required_fields: &FieldSet,
     ) -> Vec<usize> {
-        let mut candidates =
-            self.filtered_constructor_candidates_for_input(obligated_input, Some(required_fields));
+        let mut candidates = self
+            .filtered_constructor_candidates_for_input(unsafe_flow_input, Some(required_fields));
         if candidates.is_empty() {
-            self.ensure_generic_constructors_for_input(obligated_input);
-            candidates = self
-                .filtered_constructor_candidates_for_input(obligated_input, Some(required_fields));
+            self.ensure_generic_constructors_for_input(unsafe_flow_input);
+            candidates = self.filtered_constructor_candidates_for_input(
+                unsafe_flow_input,
+                Some(required_fields),
+            );
         }
         self.rank_and_truncate_constructor_candidates(&mut candidates);
         candidates
@@ -1584,10 +1597,10 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
     fn build_target_plans(
         &mut self,
         api_index: usize,
-        obligated_params: &[usize],
+        unsafe_flow_params: &[usize],
     ) -> Option<Vec<CallPlan>> {
         let inputs = self.apis[api_index].inputs.clone();
-        let obligated = obligated_params.iter().copied().collect::<HashSet<_>>();
+        let unsafe_flow_param_set = unsafe_flow_params.iter().copied().collect::<HashSet<_>>();
         let mut partials = vec![PartialCallPlan {
             prefix: Vec::new(),
             args: vec![None; inputs.len()],
@@ -1595,7 +1608,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         }];
 
         for (param_index, input) in inputs.iter().enumerate() {
-            if obligated.contains(&param_index) {
+            if unsafe_flow_param_set.contains(&param_index) {
                 continue;
             }
 
@@ -1711,7 +1724,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
 
     fn truncate_combined_sequences(
         &self,
-        sequences: &mut Vec<CombinedObligatedParamSteps>,
+        sequences: &mut Vec<CombinedUnsafeFlowParamSteps>,
         limit: usize,
     ) {
         if self.ranking_enabled {
@@ -1776,8 +1789,8 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
     fn materialize_target_suites(
         &mut self,
         target_api: usize,
-        candidates: &[MultiObligatedParamCandidatePath],
-        has_explicit_root_obligations: bool,
+        candidates: &[MultiUnsafeFlowParamCandidatePath],
+        has_explicit_root_unsafe_flow_entries: bool,
     ) -> MaterializedTargetSuites {
         if candidates.is_empty() {
             return MaterializedTargetSuites {
@@ -1786,14 +1799,15 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             };
         }
 
-        let obligated_params = candidates[0]
-            .obligated_params
+        let unsafe_flow_params = candidates[0]
+            .unsafe_flow_params
             .iter()
-            .map(|candidate| candidate.obligated_param)
+            .map(|candidate| candidate.unsafe_flow_param)
             .collect::<Vec<_>>();
         let is_indirect_target =
             matches!(self.apis[target_api].api_safety, ApiSafety::IndirectUnsafe);
-        let Some(mut target_plans) = self.build_target_plans(target_api, &obligated_params) else {
+        let Some(mut target_plans) = self.build_target_plans(target_api, &unsafe_flow_params)
+        else {
             return MaterializedTargetSuites {
                 sequences: Vec::new(),
                 failure_reason: Some("target_plan_unmaterializable"),
@@ -1805,49 +1819,49 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         }
 
         let mut sequences = Vec::new();
-        let mut saw_candidate_with_unmaterialized_obligation = false;
+        let mut saw_candidate_with_unmaterialized_unsafe_flow_param = false;
         let mut saw_depth_pruned_combined_prefix = false;
         for candidate in candidates {
-            let obligated_param_variants = candidate
-                .obligated_params
+            let unsafe_flow_param_variants = candidate
+                .unsafe_flow_params
                 .iter()
                 .map(|candidate| {
                     (
-                        candidate.obligated_param,
-                        self.materialize_obligated_param_candidate(target_api, candidate),
+                        candidate.unsafe_flow_param,
+                        self.materialize_unsafe_flow_param_candidate(target_api, candidate),
                     )
                 })
                 .collect::<Vec<_>>();
-            if obligated_param_variants
+            if unsafe_flow_param_variants
                 .iter()
                 .any(|(_, variants)| variants.is_empty())
             {
-                saw_candidate_with_unmaterialized_obligation = true;
+                saw_candidate_with_unmaterialized_unsafe_flow_param = true;
                 continue;
             }
 
             let should_cap_combined = is_indirect_target
-                && has_explicit_root_obligations
-                && obligated_param_variants.len() > 1
-                && obligated_param_variants.iter().any(|(_, variants)| {
+                && has_explicit_root_unsafe_flow_entries
+                && unsafe_flow_param_variants.len() > 1
+                && unsafe_flow_param_variants.iter().any(|(_, variants)| {
                     variants
                         .iter()
-                        .any(|obligated_steps| obligated_steps.mutator_count > 0)
+                        .any(|unsafe_flow_steps| unsafe_flow_steps.mutator_count > 0)
                 });
 
-            let mut combined = vec![CombinedObligatedParamSteps {
+            let mut combined = vec![CombinedUnsafeFlowParamSteps {
                 steps: Vec::new(),
-                obligated_sources: HashMap::new(),
+                unsafe_flow_sources: HashMap::new(),
                 mutator_count: 0,
                 materialization_cost: 0.0,
             }];
 
-            for (_obligated_param, variants) in &obligated_param_variants {
+            for (_unsafe_flow_param, variants) in &unsafe_flow_param_variants {
                 let mut next = Vec::new();
                 'combine: for prefix in &combined {
-                    for obligated_steps in variants {
+                    for unsafe_flow_steps in variants {
                         let candidate =
-                            merge_combined_with_obligated_param(prefix, obligated_steps);
+                            merge_combined_with_unsafe_flow_param(prefix, unsafe_flow_steps);
                         if candidate.mutator_count > self.max_mutators_per_target {
                             continue;
                         }
@@ -1892,9 +1906,9 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
 
             'emit_sequences: for combined_prefix in combined {
                 for plan in &target_plans {
-                    if let Some(steps) = append_multi_obligated_param_call(
+                    if let Some(steps) = append_multi_unsafe_flow_param_call(
                         combined_prefix.steps.clone(),
-                        &combined_prefix.obligated_sources,
+                        &combined_prefix.unsafe_flow_sources,
                         &self.apis[target_api],
                         target_api,
                         plan,
@@ -1903,7 +1917,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                         sequences.push((
                             steps.clone(),
                             steps.len() as f32 + combined_prefix.materialization_cost,
-                            obligated_params.first().copied(),
+                            unsafe_flow_params.first().copied(),
                             combined_prefix.mutator_count,
                         ));
                         if sequence_limit.is_some_and(|limit| sequences.len() >= limit) {
@@ -1951,8 +1965,8 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             )
             .collect::<Vec<_>>();
         let failure_reason = if sequences.is_empty() {
-            if saw_candidate_with_unmaterialized_obligation {
-                Some("obligated_param_unmaterializable")
+            if saw_candidate_with_unmaterialized_unsafe_flow_param {
+                Some("unsafe_flow_param_unmaterializable")
             } else if saw_depth_pruned_combined_prefix {
                 Some("combined_prefix_depth_pruned")
             } else {
@@ -2209,9 +2223,9 @@ mod tests {
                 successor: Vec::new(),
                 latest_call: 0,
                 mutated_param: None,
-                selected_obligation_call: None,
-                selected_obligation_param: None,
-                selected_obligation_fields: FieldSet::new(),
+                selected_unsafe_flow_call: None,
+                selected_unsafe_flow_param: None,
+                selected_unsafe_flow_fields: FieldSet::new(),
                 ranking_value: 0.0,
                 construction_cost: 1.0,
                 prefix_distance: 0.0,
@@ -2230,7 +2244,7 @@ mod tests {
 
     fn test_sequence_with_fields(fields: FieldSet) -> SequenceCandidate {
         let mut candidate = test_sequence(0);
-        candidate.sequence.selected_obligation_fields = fields;
+        candidate.sequence.selected_unsafe_flow_fields = fields;
         candidate
     }
 
@@ -2238,8 +2252,8 @@ mod tests {
         TargetQueueState {
             target_api: 0,
             unsafe_wrapper: String::new(),
-            obligated_params: Vec::new(),
-            has_explicit_obligations: false,
+            unsafe_flow_params: Vec::new(),
+            has_explicit_unsafe_flow_entries: false,
             base_sequences_before_cap: 0,
             base_materialization_failure: None,
             seen_signatures: HashSet::new(),

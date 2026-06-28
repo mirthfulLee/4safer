@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 impl<'tcx, 'a> Planner<'tcx, 'a> {
     /// Collect all API instances that are valid obligation-driven targets
     /// before representative-shape capping.
-    pub(super) fn collect_obligation_targets(&self) -> Vec<usize> {
+    pub(super) fn collect_unsafe_flow_targets(&self) -> Vec<usize> {
         self.apis
             .iter()
-            .filter(|api| api.supported && api.api_safety.is_obligation_target())
+            .filter(|api| api.supported && api.api_safety.is_unsafe_flow_target())
             .map(|api| api.index)
             .collect()
     }
@@ -175,7 +175,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
 
     fn target_materialization_rank(&self, api_index: usize) -> TargetMaterializationRank {
         let api = &self.apis[api_index];
-        let obligated = select_obligated_params(api)
+        let unsafe_flow_params = select_unsafe_flow_params(api)
             .params
             .into_iter()
             .collect::<HashSet<_>>();
@@ -191,7 +191,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 context_inputs += 1;
                 continue;
             }
-            if obligated.contains(&param_index) {
+            if unsafe_flow_params.contains(&param_index) {
                 if supports_direct_symbolic_input(self.tcx, *input) {
                     symbolic_inputs += 1;
                     continue;
@@ -287,15 +287,15 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let obligation_shape = api
+        let unsafe_relevance_shape = api
             .field_facts
-            .obligation_inputs
+            .unsafe_relevance_inputs
             .iter()
             .map(|fields| fields.len().to_string())
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "{receiver_shape}|{}|{borrow_shape}|{}|{obligation_shape}",
+            "{receiver_shape}|{}|{borrow_shape}|{}|{unsafe_relevance_shape}",
             api.inputs.len(),
             api.output_adapter as u8
         )
@@ -332,12 +332,12 @@ enum CheapConstructorSupport {
 
 /// Select the parameters whose state must be materialized or repaired before
 /// the target call can serve as a verification target.
-pub(super) fn select_obligated_params(api: &ApiDescriptor<'_>) -> ObligatedParamSelection {
-    let has_explicit_obligations = api
+pub(super) fn select_unsafe_flow_params(api: &ApiDescriptor<'_>) -> UnsafeFlowParamSelection {
+    let has_explicit_unsafe_flow_entries = api
         .inputs
         .iter()
         .enumerate()
-        .any(|(index, _input)| has_explicit_target_obligations(api, index));
+        .any(|(index, _input)| has_explicit_target_unsafe_flow_entries(api, index));
     if matches!(api.api_safety, ApiSafety::UnsafeBlock) {
         let mut params = (0..api.inputs.len()).collect::<Vec<_>>();
         params.sort_by_key(|index| {
@@ -346,9 +346,9 @@ pub(super) fn select_obligated_params(api: &ApiDescriptor<'_>) -> ObligatedParam
                 TyKind::Ref(_, _, ty::Mutability::Mut)
             ))
         });
-        return ObligatedParamSelection {
+        return UnsafeFlowParamSelection {
             params,
-            has_explicit_obligations,
+            has_explicit_unsafe_flow_entries,
         };
     }
 
@@ -357,13 +357,13 @@ pub(super) fn select_obligated_params(api: &ApiDescriptor<'_>) -> ObligatedParam
         .iter()
         .enumerate()
         .filter_map(|(index, _input)| {
-            let obligations = initial_target_obligations(api, index);
-            (!obligations.is_empty()).then_some(index)
+            let pending_entries = initial_target_unsafe_flow_entries(api, index);
+            (!pending_entries.is_empty()).then_some(index)
         })
         .collect::<Vec<_>>();
     params.sort_by_key(|index| {
         (
-            usize::from(initial_target_obligations(api, *index).is_empty()),
+            usize::from(initial_target_unsafe_flow_entries(api, *index).is_empty()),
             usize::from(!matches!(
                 api.inputs[*index].kind(),
                 TyKind::Ref(_, _, ty::Mutability::Mut)
@@ -379,15 +379,18 @@ pub(super) fn select_obligated_params(api: &ApiDescriptor<'_>) -> ObligatedParam
             ))
         });
     }
-    ObligatedParamSelection {
+    UnsafeFlowParamSelection {
         params,
-        has_explicit_obligations,
+        has_explicit_unsafe_flow_entries,
     }
 }
 
-pub(super) fn has_explicit_target_obligations(api: &ApiDescriptor<'_>, param_index: usize) -> bool {
+pub(super) fn has_explicit_target_unsafe_flow_entries(
+    api: &ApiDescriptor<'_>,
+    param_index: usize,
+) -> bool {
     api.field_facts
-        .obligation_inputs
+        .unsafe_relevance_inputs
         .get(param_index)
         .is_some_and(|fields| !fields.is_empty())
 }
@@ -395,7 +398,7 @@ pub(super) fn has_explicit_target_obligations(api: &ApiDescriptor<'_>, param_ind
 pub(super) fn mono_target_priority(api: &ApiDescriptor<'_>) -> (usize, usize, usize) {
     (
         usize::from(api.api_safety != ApiSafety::UnsafeBlock),
-        usize::from(api.field_facts.obligation_inputs.is_empty()),
+        usize::from(api.field_facts.unsafe_relevance_inputs.is_empty()),
         api.concrete_args
             .iter()
             .map(|arg| canonical_symbolic_arg_rank(arg))

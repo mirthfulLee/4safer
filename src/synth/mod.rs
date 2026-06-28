@@ -50,7 +50,7 @@ impl ApiSafety {
         matches!(self, ApiSafety::UnsafeFn)
     }
 
-    pub fn is_obligation_target(self) -> bool {
+    pub fn is_unsafe_flow_target(self) -> bool {
         matches!(self, ApiSafety::UnsafeBlock | ApiSafety::IndirectUnsafe)
     }
 }
@@ -108,9 +108,9 @@ pub struct SequencePlan {
     pub successor: Vec<usize>,
     pub latest_call: usize,
     pub mutated_param: Option<usize>,
-    pub selected_obligation_call: Option<usize>,
-    pub selected_obligation_param: Option<usize>,
-    pub selected_obligation_fields: FieldSet,
+    pub selected_unsafe_flow_call: Option<usize>,
+    pub selected_unsafe_flow_param: Option<usize>,
+    pub selected_unsafe_flow_fields: FieldSet,
     pub ranking_value: f32,
     pub construction_cost: f32,
     pub prefix_distance: f32,
@@ -152,7 +152,7 @@ pub struct SequenceCandidate {
 }
 
 #[derive(Clone, Debug)]
-/// Summarizes one mutator-expansion round for one obligation-driven target.
+/// Summarizes one mutator-expansion round for one unsafe-flow target.
 pub struct MutatorRoundSummary {
     pub round: usize,
     pub parent_sequences_considered: usize,
@@ -169,8 +169,8 @@ pub struct MutatorRoundSummary {
 pub struct TargetSynthesisSummary {
     pub target_api: usize,
     pub unsafe_wrapper: String,
-    pub obligated_params: Vec<usize>,
-    pub has_explicit_obligations: bool,
+    pub unsafe_flow_params: Vec<usize>,
+    pub has_explicit_unsafe_flow_entries: bool,
     pub base_sequences_before_cap: usize,
     pub base_sequences_after_cap: usize,
     pub base_materialization_failure: Option<&'static str>,
@@ -187,8 +187,8 @@ pub struct TargetSynthesisSummary {
 }
 
 #[derive(Clone)]
-/// Groups all supported APIs and the sequences synthesized for obligation-driven
-/// verification.
+/// Groups all supported APIs and the sequences synthesized for unsafe-flow
+/// guided verification.
 pub struct SynthesizedSuite<'tcx> {
     pub apis: Vec<ApiDescriptor<'tcx>>,
     pub sequences: Vec<SequencePlan>,

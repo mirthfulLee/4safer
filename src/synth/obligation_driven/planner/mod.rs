@@ -64,7 +64,7 @@ impl Default for PlannerCaps {
 struct PlannerTuning {
     top_k_candidates: usize,
     max_basic_constructor_sequences: usize,
-    max_materialized_variants_per_obligated_param: usize,
+    max_materialized_variants_per_unsafe_flow_param: usize,
     max_target_plan_candidates: usize,
     max_call_plan_candidates: usize,
     max_combined_prefixes: usize,
@@ -86,7 +86,7 @@ impl Default for PlannerTuning {
         Self {
             top_k_candidates: DEFAULT_TOP_K_CANDIDATES,
             max_basic_constructor_sequences: MAX_BASIC_CONSTRUCTOR_SEQUENCES,
-            max_materialized_variants_per_obligated_param:
+            max_materialized_variants_per_unsafe_flow_param:
                 MAX_MATERIALIZED_VARIANTS_PER_OBLIGATED_PARAM,
             max_target_plan_candidates: MAX_TARGET_PLAN_CANDIDATES,
             max_call_plan_candidates: MAX_CALL_PLAN_CANDIDATES,
@@ -123,8 +123,8 @@ impl PlannerTuning {
         Self {
             top_k_candidates: defaults.top_k_candidates,
             max_basic_constructor_sequences: defaults.max_basic_constructor_sequences,
-            max_materialized_variants_per_obligated_param: defaults
-                .max_materialized_variants_per_obligated_param,
+            max_materialized_variants_per_unsafe_flow_param: defaults
+                .max_materialized_variants_per_unsafe_flow_param,
             max_target_plan_candidates: defaults.max_target_plan_candidates,
             max_call_plan_candidates: env_usize(
                 "FOURSAFER_OD_MAX_CALL_PLAN_CANDIDATES",
@@ -181,14 +181,14 @@ pub(crate) struct Planner<'tcx, 'a> {
 }
 
 #[derive(Clone, Debug)]
-struct ObligatedParamCandidatePath {
-    obligated_param: usize,
+struct UnsafeFlowParamCandidatePath {
+    unsafe_flow_param: usize,
     remaining_needed: FieldSet,
 }
 
 #[derive(Clone, Debug)]
-struct MultiObligatedParamCandidatePath {
-    obligated_params: Vec<ObligatedParamCandidatePath>,
+struct MultiUnsafeFlowParamCandidatePath {
+    unsafe_flow_params: Vec<UnsafeFlowParamCandidatePath>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -205,18 +205,18 @@ struct PartialCallPlan {
 }
 
 #[derive(Clone, Debug)]
-struct ObligatedParamSteps {
-    obligated_param: usize,
+struct UnsafeFlowParamSteps {
+    unsafe_flow_param: usize,
     steps: Vec<CallStep>,
-    obligated_source: ValueSource,
+    unsafe_flow_source: ValueSource,
     mutator_count: usize,
     materialization_cost: f32,
 }
 
 #[derive(Clone, Debug)]
-struct CombinedObligatedParamSteps {
+struct CombinedUnsafeFlowParamSteps {
     steps: Vec<CallStep>,
-    obligated_sources: HashMap<usize, ValueSource>,
+    unsafe_flow_sources: HashMap<usize, ValueSource>,
     mutator_count: usize,
     materialization_cost: f32,
 }
@@ -228,9 +228,9 @@ struct MutatorExpansionResult {
 }
 
 #[derive(Clone, Debug)]
-struct ObligatedParamSelection {
+struct UnsafeFlowParamSelection {
     params: Vec<usize>,
-    has_explicit_obligations: bool,
+    has_explicit_unsafe_flow_entries: bool,
 }
 
 impl<'tcx, 'a> Planner<'tcx, 'a> {
@@ -314,7 +314,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
     }
 
     pub(crate) fn synthesize(mut self) -> SynthesizedSuite<'tcx> {
-        let target_groups = self.select_target_function_groups(self.collect_obligation_targets());
+        let target_groups = self.select_target_function_groups(self.collect_unsafe_flow_targets());
         info!(
             target: "foursafer::planner",
             "obligation-driven planner: {} ranked unsafe wrappers",

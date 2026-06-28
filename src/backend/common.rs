@@ -19,8 +19,10 @@ struct ApiFunctionMetadata {
     api_safety: String,
     supported: bool,
     unsafe_wrappers: Vec<String>,
-    obligation_inputs: Vec<Vec<Vec<u32>>>,
-    obligation_input_distances: Vec<Vec<FieldDistanceEntry>>,
+    #[serde(rename = "obligation_inputs")]
+    unsafe_relevance_inputs: Vec<Vec<Vec<u32>>>,
+    #[serde(rename = "obligation_input_distances")]
+    unsafe_relevance_input_distances: Vec<Vec<FieldDistanceEntry>>,
     avg_target_distance: Option<f32>,
 }
 
@@ -37,9 +39,12 @@ struct SequenceMetadata {
     latest_mutator: Option<usize>,
     latest_mutator_path: Option<String>,
     latest_mutator_param: Option<usize>,
-    selected_obligation_call: Option<usize>,
-    selected_obligation_call_path: Option<String>,
-    selected_obligation_param: Option<usize>,
+    #[serde(rename = "selected_obligation_call")]
+    selected_unsafe_flow_call: Option<usize>,
+    #[serde(rename = "selected_obligation_call_path")]
+    selected_unsafe_flow_call_path: Option<String>,
+    #[serde(rename = "selected_obligation_param")]
+    selected_unsafe_flow_param: Option<usize>,
     ranking_value: f32,
     construction_cost: f32,
     prefix_distance: f32,
@@ -68,8 +73,10 @@ struct TargetSynthesisMetadata {
     target: usize,
     target_path: String,
     unsafe_wrapper: String,
-    obligated_params: Vec<usize>,
-    has_explicit_obligations: bool,
+    #[serde(rename = "obligated_params")]
+    unsafe_flow_params: Vec<usize>,
+    #[serde(rename = "has_explicit_obligations")]
+    has_explicit_unsafe_flow_entries: bool,
     base_sequences_before_cap: usize,
     base_sequences_after_cap: usize,
     base_materialization_failure: Option<String>,
@@ -101,10 +108,14 @@ struct MutatorSelectionTrace {
     latest_mutator_path: String,
     latest_mutator_param: usize,
     latest_mutator_provided_fields: Vec<Vec<u32>>,
-    selected_obligation_call: usize,
-    selected_obligation_call_path: String,
-    selected_obligation_param: usize,
-    selected_obligation_fields: Vec<Vec<u32>>,
+    #[serde(rename = "selected_obligation_call")]
+    selected_unsafe_flow_call: usize,
+    #[serde(rename = "selected_obligation_call_path")]
+    selected_unsafe_flow_call_path: String,
+    #[serde(rename = "selected_obligation_param")]
+    selected_unsafe_flow_param: usize,
+    #[serde(rename = "selected_obligation_fields")]
+    selected_unsafe_flow_fields: Vec<Vec<u32>>,
 }
 
 pub(super) struct GeneratedLayout {
@@ -172,16 +183,16 @@ pub(super) fn write_suite_metadata(
             api_safety: api.api_safety.as_str().to_owned(),
             supported: api.supported,
             unsafe_wrappers: api.unsafe_wrappers_without_std_internal(),
-            obligation_inputs: render_field_sets(&api.field_facts.obligation_inputs),
-            obligation_input_distances: api
+            unsafe_relevance_inputs: render_field_sets(&api.field_facts.unsafe_relevance_inputs),
+            unsafe_relevance_input_distances: api
                 .field_facts
-                .obligation_input_distances
+                .unsafe_relevance_input_distances
                 .iter()
                 .map(render_field_distance_map)
                 .collect(),
             avg_target_distance: average_target_distance(
-                &api.field_facts.obligation_inputs,
-                &api.field_facts.obligation_input_distances,
+                &api.field_facts.unsafe_relevance_inputs,
+                &api.field_facts.unsafe_relevance_input_distances,
             ),
         })
         .collect::<Vec<_>>();
@@ -200,11 +211,11 @@ pub(super) fn write_suite_metadata(
                 .then_some(sequence.steps[sequence.latest_call].api_index);
             let latest_mutator_path =
                 latest_mutator.map(|api_index| suite.apis[api_index].path.clone());
-            let selected_obligation_call = sequence
-                .selected_obligation_call
+            let selected_unsafe_flow_call = sequence
+                .selected_unsafe_flow_call
                 .map(|step_index| sequence.steps[step_index].api_index);
-            let selected_obligation_call_path =
-                selected_obligation_call.map(|api_index| suite.apis[api_index].path.clone());
+            let selected_unsafe_flow_call_path =
+                selected_unsafe_flow_call.map(|api_index| suite.apis[api_index].path.clone());
 
             SequenceMetadata {
                 index,
@@ -218,9 +229,9 @@ pub(super) fn write_suite_metadata(
                 latest_mutator,
                 latest_mutator_path,
                 latest_mutator_param: sequence.mutated_param,
-                selected_obligation_call,
-                selected_obligation_call_path,
-                selected_obligation_param: sequence.selected_obligation_param,
+                selected_unsafe_flow_call,
+                selected_unsafe_flow_call_path,
+                selected_unsafe_flow_param: sequence.selected_unsafe_flow_param,
                 ranking_value: sequence.ranking_value,
                 construction_cost: sequence.construction_cost,
                 prefix_distance: sequence.prefix_distance,
@@ -248,16 +259,18 @@ pub(super) fn write_suite_metadata(
             target: summary.target_api,
             target_path: suite.apis[summary.target_api].path.clone(),
             unsafe_wrapper: summary.unsafe_wrapper.clone(),
-            obligated_params: summary.obligated_params.clone(),
-            has_explicit_obligations: summary.has_explicit_obligations,
+            unsafe_flow_params: summary.unsafe_flow_params.clone(),
+            has_explicit_unsafe_flow_entries: summary.has_explicit_unsafe_flow_entries,
             base_sequences_before_cap: summary.base_sequences_before_cap,
             base_sequences_after_cap: summary.base_sequences_after_cap,
             base_materialization_failure: summary.base_materialization_failure.map(str::to_owned),
             avg_target_distance: average_target_distance(
-                &suite.apis[summary.target_api].field_facts.obligation_inputs,
                 &suite.apis[summary.target_api]
                     .field_facts
-                    .obligation_input_distances,
+                    .unsafe_relevance_inputs,
+                &suite.apis[summary.target_api]
+                    .field_facts
+                    .unsafe_relevance_input_distances,
             ),
             wrapper_sequence_cap: summary.wrapper_sequence_cap,
             wrapper_sequences_accepted: summary.wrapper_sequences_accepted,
@@ -318,13 +331,15 @@ fn render_field_distance_map(map: &FieldDistanceMap) -> Vec<FieldDistanceEntry> 
 }
 
 fn average_target_distance(
-    obligation_inputs: &[FieldSet],
-    obligation_input_distances: &[FieldDistanceMap],
+    unsafe_relevance_inputs: &[FieldSet],
+    unsafe_relevance_input_distances: &[FieldDistanceMap],
 ) -> Option<f32> {
     let mut total = 0u32;
     let mut count = 0u32;
 
-    for (required_fields, distance_map) in obligation_inputs.iter().zip(obligation_input_distances)
+    for (required_fields, distance_map) in unsafe_relevance_inputs
+        .iter()
+        .zip(unsafe_relevance_input_distances)
     {
         for field in required_fields {
             if let Some(distance) = distance_for_field(distance_map, field) {
@@ -364,10 +379,10 @@ fn write_mutator_selection_trace(
         let Some(latest_mutator_param) = sequence.mutated_param else {
             continue;
         };
-        let Some(selected_obligation_call_step) = sequence.selected_obligation_call else {
+        let Some(selected_unsafe_flow_call_step) = sequence.selected_unsafe_flow_call else {
             continue;
         };
-        let Some(selected_obligation_param) = sequence.selected_obligation_param else {
+        let Some(selected_unsafe_flow_param) = sequence.selected_unsafe_flow_param else {
             continue;
         };
 
@@ -386,14 +401,14 @@ fn write_mutator_selection_trace(
                 .unwrap_or_default()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            selected_obligation_call: sequence.steps[selected_obligation_call_step].api_index,
-            selected_obligation_call_path: suite.apis
-                [sequence.steps[selected_obligation_call_step].api_index]
+            selected_unsafe_flow_call: sequence.steps[selected_unsafe_flow_call_step].api_index,
+            selected_unsafe_flow_call_path: suite.apis
+                [sequence.steps[selected_unsafe_flow_call_step].api_index]
                 .path
                 .clone(),
-            selected_obligation_param,
-            selected_obligation_fields: sequence
-                .selected_obligation_fields
+            selected_unsafe_flow_param,
+            selected_unsafe_flow_fields: sequence
+                .selected_unsafe_flow_fields
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>(),

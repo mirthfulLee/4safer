@@ -85,8 +85,8 @@ pub fn run_pipeline<'tcx>(tcx: TyCtxt<'tcx>, cli: &FourSaferArgs) -> Result<Anal
     let mono_api_count = suite.apis.iter().filter(|api| api.is_mono).count();
     let supported_api_count = suite.apis.iter().filter(|api| api.supported).count();
     let pre_mono_target_api_count =
-        pre_mono_obligation_target_api_count(tcx, &graph, &field_facts_index);
-    let target_api_count = obligation_target_api_count(&suite);
+        pre_mono_unsafe_flow_target_api_count(tcx, &graph, &field_facts_index);
+    let target_api_count = unsafe_flow_target_api_count(&suite);
     let synthesized_target_api_indices = suite
         .sequences
         .iter()
@@ -147,7 +147,7 @@ pub fn run_pipeline<'tcx>(tcx: TyCtxt<'tcx>, cli: &FourSaferArgs) -> Result<Anal
     })
 }
 
-fn pre_mono_obligation_target_api_count<'tcx>(
+fn pre_mono_unsafe_flow_target_api_count<'tcx>(
     tcx: TyCtxt<'tcx>,
     graph: &ApiDependencyGraph<'tcx>,
     field_facts_index: &ApiFieldFactsIndex,
@@ -161,15 +161,15 @@ fn pre_mono_obligation_target_api_count<'tcx>(
             let path = render_api_path(tcx, graph, def_id, args);
             let api_safety = classify_api_safety(def_id, tcx, field_facts_index);
             is_supported_callable(tcx, graph, def_id, args, &path, api_safety)
-                && api_safety.is_obligation_target()
+                && api_safety.is_unsafe_flow_target()
         })
         .count()
 }
 
-fn obligation_target_api_count(suite: &crate::synth::SynthesizedSuite<'_>) -> usize {
+fn unsafe_flow_target_api_count(suite: &crate::synth::SynthesizedSuite<'_>) -> usize {
     suite
         .apis
         .iter()
-        .filter(|api| api.supported && api.api_safety.is_obligation_target())
+        .filter(|api| api.supported && api.api_safety.is_unsafe_flow_target())
         .count()
 }

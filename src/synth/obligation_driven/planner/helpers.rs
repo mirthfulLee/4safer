@@ -10,26 +10,29 @@ pub(super) fn earliest_mutator_insertion_index(sequence: &SequencePlan) -> usize
 
 pub(super) fn basic_target_candidate(
     target_api: usize,
-    obligated_params: &[usize],
+    unsafe_flow_params: &[usize],
     apis: &[ApiDescriptor<'_>],
-) -> MultiObligatedParamCandidatePath {
-    MultiObligatedParamCandidatePath {
-        obligated_params: obligated_params
+) -> MultiUnsafeFlowParamCandidatePath {
+    MultiUnsafeFlowParamCandidatePath {
+        unsafe_flow_params: unsafe_flow_params
             .iter()
-            .map(|param_index| ObligatedParamCandidatePath {
-                obligated_param: *param_index,
-                remaining_needed: initial_target_obligations(&apis[target_api], *param_index),
+            .map(|param_index| UnsafeFlowParamCandidatePath {
+                unsafe_flow_param: *param_index,
+                remaining_needed: initial_target_unsafe_flow_entries(
+                    &apis[target_api],
+                    *param_index,
+                ),
             })
             .collect(),
     }
 }
 
-pub(super) fn extend_source_obligation(
-    obligations: &mut HashMap<ValueSource, FieldSet>,
+pub(super) fn extend_source_unsafe_flow_entries(
+    pending_entries: &mut HashMap<ValueSource, FieldSet>,
     source: &ValueSource,
     required: FieldSet,
 ) {
-    obligations
+    pending_entries
         .entry(source.clone())
         .or_default()
         .extend(required);
@@ -42,7 +45,7 @@ pub(super) fn target_required_fields(
     target_required_fields_for_param(target, receiver_param)
 }
 
-pub(super) fn initial_target_obligations(
+pub(super) fn initial_target_unsafe_flow_entries(
     target: &ApiDescriptor<'_>,
     receiver_param: usize,
 ) -> FieldSet {
@@ -66,14 +69,14 @@ pub(super) fn target_required_fields_for_param(
     if !contract_fields.is_empty() {
         return contract_fields;
     }
-    let obligation_fields = api
+    let unsafe_relevance_fields = api
         .field_facts
-        .obligation_inputs
+        .unsafe_relevance_inputs
         .get(param_index)
         .cloned()
         .unwrap_or_default();
-    if !obligation_fields.is_empty() {
-        return obligation_fields;
+    if !unsafe_relevance_fields.is_empty() {
+        return unsafe_relevance_fields;
     }
     api.field_facts
         .mutated_inputs
@@ -92,14 +95,14 @@ pub(super) fn call_required_fields(api: &ApiDescriptor<'_>, param_index: usize) 
     if !contract_fields.is_empty() {
         return contract_fields;
     }
-    let obligation_fields = api
+    let unsafe_relevance_fields = api
         .field_facts
-        .obligation_inputs
+        .unsafe_relevance_inputs
         .get(param_index)
         .cloned()
         .unwrap_or_default();
-    if !obligation_fields.is_empty() {
-        return obligation_fields;
+    if !unsafe_relevance_fields.is_empty() {
+        return unsafe_relevance_fields;
     }
     if api_has_contract_summary(api) {
         return FieldSet::new();
@@ -131,7 +134,7 @@ pub(super) fn output_required_fields(
     }
 
     api.field_facts
-        .obligation_inputs
+        .unsafe_relevance_inputs
         .get(param_index)
         .cloned()
         .unwrap_or_default()
@@ -198,7 +201,7 @@ pub(super) fn average_distance_for_required_fields(
 ) -> Option<f32> {
     let map = api
         .field_facts
-        .obligation_input_distances
+        .unsafe_relevance_input_distances
         .get(param_index)?;
     let mut total = 0u32;
     let mut count = 0u32;
@@ -219,9 +222,9 @@ pub(super) fn average_target_distance(api: &ApiDescriptor<'_>) -> Option<f32> {
 
     for (required_fields, map) in api
         .field_facts
-        .obligation_inputs
+        .unsafe_relevance_inputs
         .iter()
-        .zip(api.field_facts.obligation_input_distances.iter())
+        .zip(api.field_facts.unsafe_relevance_input_distances.iter())
     {
         for field in required_fields {
             if let Some(distance) = distance_for_field(map, field) {
@@ -255,7 +258,7 @@ pub(super) fn required_fields_before_call(
     }
 }
 
-pub(super) fn obligated_state_ty(input: Ty<'_>) -> TyWrapper<'_> {
+pub(super) fn unsafe_flow_state_ty(input: Ty<'_>) -> TyWrapper<'_> {
     match input.kind() {
         TyKind::Ref(_, inner, _) | TyKind::RawPtr(inner, _) => TyWrapper::from(*inner),
         _ => TyWrapper::from(input),
@@ -474,54 +477,54 @@ pub(super) fn dedupe_step_sequences(sequences: Vec<Vec<CallStep>>) -> Vec<Vec<Ca
     deduped
 }
 
-pub(super) fn dedupe_obligated_param_steps(
-    sequences: Vec<ObligatedParamSteps>,
-) -> Vec<ObligatedParamSteps> {
+pub(super) fn dedupe_unsafe_flow_param_steps(
+    sequences: Vec<UnsafeFlowParamSteps>,
+) -> Vec<UnsafeFlowParamSteps> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
-    for obligated_steps in sequences {
+    for unsafe_flow_steps in sequences {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         use std::hash::{Hash, Hasher};
-        obligated_steps.steps.hash(&mut hasher);
-        obligated_steps.obligated_param.hash(&mut hasher);
-        obligated_steps.obligated_source.hash(&mut hasher);
+        unsafe_flow_steps.steps.hash(&mut hasher);
+        unsafe_flow_steps.unsafe_flow_param.hash(&mut hasher);
+        unsafe_flow_steps.unsafe_flow_source.hash(&mut hasher);
         let signature = hasher.finish();
         if seen.insert(signature) {
-            deduped.push(obligated_steps);
+            deduped.push(unsafe_flow_steps);
         }
     }
     deduped
 }
 
-pub(super) fn merge_combined_with_obligated_param(
-    left: &CombinedObligatedParamSteps,
-    right: &ObligatedParamSteps,
-) -> CombinedObligatedParamSteps {
+pub(super) fn merge_combined_with_unsafe_flow_param(
+    left: &CombinedUnsafeFlowParamSteps,
+    right: &UnsafeFlowParamSteps,
+) -> CombinedUnsafeFlowParamSteps {
     let step_offset = left.steps.len();
-    let param_offset = combined_symbolic_param_count(&left.steps, &left.obligated_sources);
+    let param_offset = combined_symbolic_param_count(&left.steps, &left.unsafe_flow_sources);
     let mut right_steps = right.steps.clone();
     shift_steps(&mut right_steps, step_offset, param_offset);
 
     let mut steps = left.steps.clone();
     steps.extend(right_steps);
 
-    let mut obligated_sources = left.obligated_sources.clone();
-    obligated_sources.insert(
-        right.obligated_param,
-        shift_value_source(&right.obligated_source, step_offset, param_offset),
+    let mut unsafe_flow_sources = left.unsafe_flow_sources.clone();
+    unsafe_flow_sources.insert(
+        right.unsafe_flow_param,
+        shift_value_source(&right.unsafe_flow_source, step_offset, param_offset),
     );
 
-    CombinedObligatedParamSteps {
+    CombinedUnsafeFlowParamSteps {
         steps,
-        obligated_sources,
+        unsafe_flow_sources,
         mutator_count: left.mutator_count + right.mutator_count,
         materialization_cost: left.materialization_cost + right.materialization_cost,
     }
 }
 
 pub(super) fn dedupe_combined_sequences(
-    sequences: Vec<CombinedObligatedParamSteps>,
-) -> Vec<CombinedObligatedParamSteps> {
+    sequences: Vec<CombinedUnsafeFlowParamSteps>,
+) -> Vec<CombinedUnsafeFlowParamSteps> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
     for combined in sequences {
@@ -534,7 +537,7 @@ pub(super) fn dedupe_combined_sequences(
 }
 
 pub(super) fn rank_and_truncate_combined_sequences(
-    sequences: &mut Vec<CombinedObligatedParamSteps>,
+    sequences: &mut Vec<CombinedUnsafeFlowParamSteps>,
     limit: usize,
 ) {
     sequences.sort_by(|left, right| {
@@ -580,8 +583,8 @@ pub(super) fn rank_and_truncate_call_plans(plans: &mut Vec<CallPlan>, limit: usi
     plans.truncate(limit);
 }
 
-pub(super) fn rank_and_truncate_obligated_param_steps(
-    sequences: &mut Vec<ObligatedParamSteps>,
+pub(super) fn rank_and_truncate_unsafe_flow_param_steps(
+    sequences: &mut Vec<UnsafeFlowParamSteps>,
     limit: usize,
 ) {
     if sequences.len() <= limit {
@@ -594,7 +597,7 @@ pub(super) fn rank_and_truncate_obligated_param_steps(
             .then(left.mutator_count.cmp(&right.mutator_count))
             .then(symbolic_param_count(&left.steps).cmp(&symbolic_param_count(&right.steps)))
             .then(sequence_signature(&left.steps).cmp(&sequence_signature(&right.steps)))
-            .then(left.obligated_param.cmp(&right.obligated_param))
+            .then(left.unsafe_flow_param.cmp(&right.unsafe_flow_param))
     });
     sequences.truncate(limit);
 }
@@ -681,7 +684,7 @@ pub(super) fn evaluate_candidate(
 
 pub(super) fn candidate_flow_score(candidate: &SequenceCandidate, tuning: &PlannerTuning) -> f32 {
     flow_score_for_parts(
-        candidate.sequence.selected_obligation_fields.len(),
+        candidate.sequence.selected_unsafe_flow_fields.len(),
         candidate.prefix_distance,
         candidate.target_to_wrapper_distance,
         tuning,
@@ -701,7 +704,7 @@ pub(super) fn flow_score_for_parts(
     propagated_fields as f32 * tuning.r_flow.powf(distance.max(0.0))
 }
 
-pub(super) fn distance_to_selected_obligation_site(
+pub(super) fn distance_to_selected_unsafe_flow_site(
     sequence: &SequencePlan,
     call_index: usize,
 ) -> u32 {
@@ -711,10 +714,14 @@ pub(super) fn distance_to_selected_obligation_site(
         .unwrap_or(u32::MAX)
 }
 
-pub(super) fn obligation_overlap_count(provided: &FieldSet, obligation: &FieldSet) -> usize {
+pub(super) fn unsafe_flow_overlap_count(provided: &FieldSet, pending_entries: &FieldSet) -> usize {
     provided
         .iter()
-        .filter(|field| obligation.iter().any(|needed| paths_overlap(field, needed)))
+        .filter(|field| {
+            pending_entries
+                .iter()
+                .any(|needed| paths_overlap(field, needed))
+        })
         .count()
 }
 
@@ -722,13 +729,13 @@ pub(super) fn mutator_candidate_rank_key(
     _base: &SequencePlan,
     mutator_api: usize,
     provided: &FieldSet,
-    obligation: &FieldSet,
+    pending_entries: &FieldSet,
     call_distance: u32,
     target_distance: f32,
     tuning: &PlannerTuning,
 ) -> (i32, i32, usize, usize) {
     let prefix_distance = call_distance.saturating_add(1) as f32;
-    let overlap = obligation_overlap_count(provided, obligation) as i32;
+    let overlap = unsafe_flow_overlap_count(provided, pending_entries) as i32;
     let flow_score = flow_score_for_parts(
         overlap.max(0) as usize,
         prefix_distance,
@@ -778,7 +785,7 @@ pub(super) fn distances_to_target(steps: &[CallStep], target_step: usize) -> Vec
 }
 
 pub(super) fn combined_prefix_has_depth_feasible_target_plan(
-    prefix: &CombinedObligatedParamSteps,
+    prefix: &CombinedUnsafeFlowParamSteps,
     target_plans: &[CallPlan],
     max_depth: usize,
 ) -> bool {
@@ -829,9 +836,9 @@ pub(super) fn extend_partials_with_constructor_sequences(
     next_partials
 }
 
-pub(super) fn append_multi_obligated_param_call<'tcx>(
+pub(super) fn append_multi_unsafe_flow_param_call<'tcx>(
     mut steps: Vec<CallStep>,
-    obligated_sources: &HashMap<usize, ValueSource>,
+    unsafe_flow_sources: &HashMap<usize, ValueSource>,
     api: &ApiDescriptor<'tcx>,
     api_index: usize,
     plan: &CallPlan,
@@ -839,7 +846,7 @@ pub(super) fn append_multi_obligated_param_call<'tcx>(
 ) -> Option<Vec<CallStep>> {
     let step_offset = steps.len();
     let mut max_param = symbolic_param_count(&steps);
-    for source in obligated_sources.values() {
+    for source in unsafe_flow_sources.values() {
         if let ValueSource::Param(index) = source {
             max_param = max_param.max(index + 1);
         }
@@ -850,9 +857,9 @@ pub(super) fn append_multi_obligated_param_call<'tcx>(
 
     let mut args = Vec::with_capacity(api.inputs.len());
     for (param_index, input) in api.inputs.iter().enumerate() {
-        if let Some(obligated_source) = obligated_sources.get(&param_index) {
+        if let Some(unsafe_flow_source) = unsafe_flow_sources.get(&param_index) {
             args.push(ArgPlan {
-                source: obligated_source.clone(),
+                source: unsafe_flow_source.clone(),
                 borrow: borrow_mode_for_input(*input),
             });
             continue;
@@ -904,10 +911,10 @@ pub(super) fn shift_value_source(
 
 pub(super) fn combined_symbolic_param_count(
     steps: &[CallStep],
-    obligated_sources: &HashMap<usize, ValueSource>,
+    unsafe_flow_sources: &HashMap<usize, ValueSource>,
 ) -> usize {
     let mut count = symbolic_param_count(steps);
-    for source in obligated_sources.values() {
+    for source in unsafe_flow_sources.values() {
         if let ValueSource::Param(index) = source {
             count = count.max(index + 1);
         }
@@ -931,18 +938,18 @@ pub(super) fn call_plan_signature(plan: &CallPlan) -> u64 {
     hasher.finish()
 }
 
-pub(super) fn combined_sequence_signature(combined: &CombinedObligatedParamSteps) -> u64 {
+pub(super) fn combined_sequence_signature(combined: &CombinedUnsafeFlowParamSteps) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     combined.steps.hash(&mut hasher);
-    let mut obligated_entries = combined
-        .obligated_sources
+    let mut unsafe_flow_entries = combined
+        .unsafe_flow_sources
         .iter()
         .map(|(param, source)| (*param, source.clone()))
         .collect::<Vec<_>>();
-    obligated_entries.sort_by_key(|(param, _)| *param);
-    obligated_entries.hash(&mut hasher);
+    unsafe_flow_entries.sort_by_key(|(param, _)| *param);
+    unsafe_flow_entries.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -1205,9 +1212,9 @@ mod tests {
             successor: Vec::new(),
             latest_call: 1,
             mutated_param: Some(0),
-            selected_obligation_call: None,
-            selected_obligation_param: None,
-            selected_obligation_fields: FieldSet::new(),
+            selected_unsafe_flow_call: None,
+            selected_unsafe_flow_param: None,
+            selected_unsafe_flow_fields: FieldSet::new(),
             ranking_value: 4.0,
             construction_cost: 4.0,
             prefix_distance: 0.0,
@@ -1240,9 +1247,9 @@ mod tests {
             successor: Vec::new(),
             latest_call: 1,
             mutated_param: None,
-            selected_obligation_call: None,
-            selected_obligation_param: None,
-            selected_obligation_fields: FieldSet::new(),
+            selected_unsafe_flow_call: None,
+            selected_unsafe_flow_param: None,
+            selected_unsafe_flow_fields: FieldSet::new(),
             ranking_value: 2.0,
             construction_cost: 2.0,
             prefix_distance: 0.0,
@@ -1301,9 +1308,9 @@ mod tests {
             successor: Vec::new(),
             latest_call: 0,
             mutated_param: None,
-            selected_obligation_call: None,
-            selected_obligation_param: None,
-            selected_obligation_fields: FieldSet::new(),
+            selected_unsafe_flow_call: None,
+            selected_unsafe_flow_param: None,
+            selected_unsafe_flow_fields: FieldSet::new(),
             ranking_value: 0.0,
             construction_cost: 0.0,
             prefix_distance: 0.0,
