@@ -14,6 +14,7 @@ use std::collections::HashSet;
 
 const MAX_MONOS_PER_FN: usize = 32;
 const MAX_OUTPUT_ONLY_MONOS_PER_FN: usize = 12;
+const MAX_AVAILABLE_TYS_PER_FN: usize = 128;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Mono<'tcx> {
@@ -1043,6 +1044,7 @@ pub(crate) fn resolve_mono_apis_with_seeds<'tcx>(
             ty.to_string(),
         )
     });
+    sorted_available_tys.truncate(MAX_AVAILABLE_TYS_PER_FN);
 
     let mut ordered_seeds = seeds.to_vec();
     ordered_seeds.sort_by_key(|seed| std::cmp::Reverse(mono_seed_specificity(seed)));

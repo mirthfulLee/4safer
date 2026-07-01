@@ -19,10 +19,7 @@ pub type FieldSet = BTreeSet<FieldPath>;
 pub type FieldDistanceMap = BTreeMap<FieldPath, u32>;
 const MAX_FIELD_PATH_DEPTH: usize = 2;
 const UNION_FIELD_BASE: u32 = 1 << 30;
-const STD_ANNOTATED_PARAMS_JSON: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/data/std_annotated_params.json"
-));
+const STD_ANNOTATED_PARAMS_JSON: &str = include_str!("../data/std_annotated_params.json");
 
 #[derive(Clone, Debug, Default)]
 #[allow(dead_code)]
@@ -717,6 +714,70 @@ fn derive_unsafe_relevance_inputs(
     field_facts: &FunctionFieldFacts,
     input_count: usize,
 ) -> (Vec<FieldSet>, Vec<FieldDistanceMap>) {
+    let (mut unsafe_relevance_inputs, mut distances) =
+        derive_backward_unsafe_relevance_inputs(transfers, field_facts, input_count);
+    let (transfer_inputs, transfer_distances) =
+        derive_transfer_read_inputs(transfers, field_facts, input_count);
+    merge_input_field_facts(
+        &mut unsafe_relevance_inputs,
+        &mut distances,
+        transfer_inputs,
+        transfer_distances,
+    );
+
+    (unsafe_relevance_inputs, distances)
+}
+
+fn derive_backward_unsafe_relevance_inputs(
+    transfers: &[FieldTransfer],
+    field_facts: &FunctionFieldFacts,
+    input_count: usize,
+) -> (Vec<FieldSet>, Vec<FieldDistanceMap>) {
+    let mut relevant_points = BTreeMap::<TransferPoint, u32>::new();
+
+    for (index, fields) in field_facts.unsafe_inputs.iter().enumerate() {
+        seed_relevant_points(&mut relevant_points, TransferRoot::Param(index), fields, 0);
+    }
+    for (index, fields) in field_facts.contract_inputs.iter().enumerate() {
+        seed_relevant_points(&mut relevant_points, TransferRoot::Param(index), fields, 0);
+    }
+    seed_relevant_points(
+        &mut relevant_points,
+        TransferRoot::Return,
+        &field_facts.unsafe_output,
+        0,
+    );
+    seed_relevant_points(
+        &mut relevant_points,
+        TransferRoot::Return,
+        &field_facts.contract_output,
+        0,
+    );
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for transfer in transfers {
+            let Some(dst_distance) = overlapping_relevant_distance(&relevant_points, &transfer.dst)
+            else {
+                continue;
+            };
+            changed |= update_relevant_point(
+                &mut relevant_points,
+                transfer.src.clone(),
+                dst_distance.saturating_add(transfer.distance),
+            );
+        }
+    }
+
+    render_input_relevance(relevant_points, input_count)
+}
+
+fn derive_transfer_read_inputs(
+    transfers: &[FieldTransfer],
+    field_facts: &FunctionFieldFacts,
+    input_count: usize,
+) -> (Vec<FieldSet>, Vec<FieldDistanceMap>) {
     let mut unsafe_relevance_inputs = vec![FieldSet::new(); input_count];
     let mut distances = vec![FieldDistanceMap::new(); input_count];
 
@@ -752,6 +813,121 @@ fn derive_unsafe_relevance_inputs(
     }
 
     (unsafe_relevance_inputs, distances)
+}
+
+fn seed_relevant_points(
+    relevant_points: &mut BTreeMap<TransferPoint, u32>,
+    root: TransferRoot,
+    fields: &FieldSet,
+    distance: u32,
+) {
+    for field in fields {
+        update_relevant_point(
+            relevant_points,
+            TransferPoint {
+                root: root.clone(),
+                path: field.clone(),
+            },
+            distance,
+        );
+    }
+}
+
+fn update_relevant_point(
+    relevant_points: &mut BTreeMap<TransferPoint, u32>,
+    point: TransferPoint,
+    distance: u32,
+) -> bool {
+    match relevant_points.get_mut(&point) {
+        Some(existing) => {
+            if distance < *existing {
+                *existing = distance;
+                true
+            } else {
+                false
+            }
+        }
+        None => {
+            relevant_points.insert(point, distance);
+            true
+        }
+    }
+}
+
+fn overlapping_relevant_distance(
+    relevant_points: &BTreeMap<TransferPoint, u32>,
+    point: &TransferPoint,
+) -> Option<u32> {
+    relevant_points
+        .iter()
+        .filter(|(candidate, _)| {
+            candidate.root == point.root && paths_overlap(&candidate.path, &point.path)
+        })
+        .map(|(_, distance)| *distance)
+        .min()
+}
+
+fn render_input_relevance(
+    relevant_points: BTreeMap<TransferPoint, u32>,
+    input_count: usize,
+) -> (Vec<FieldSet>, Vec<FieldDistanceMap>) {
+    let mut unsafe_relevance_inputs = vec![FieldSet::new(); input_count];
+    let mut distances = vec![FieldDistanceMap::new(); input_count];
+
+    for (point, distance) in relevant_points {
+        let TransferRoot::Param(index) = point.root else {
+            continue;
+        };
+        let Some(fields) = unsafe_relevance_inputs.get_mut(index) else {
+            continue;
+        };
+        fields.insert(point.path.clone());
+        update_min_distance(
+            distances
+                .get_mut(index)
+                .expect("param index should be within function inputs"),
+            point.path,
+            distance,
+        );
+    }
+
+    (unsafe_relevance_inputs, distances)
+}
+
+fn merge_input_field_facts(
+    unsafe_relevance_inputs: &mut [FieldSet],
+    distances: &mut [FieldDistanceMap],
+    additional_inputs: Vec<FieldSet>,
+    additional_distances: Vec<FieldDistanceMap>,
+) {
+    for (index, fields) in additional_inputs.into_iter().enumerate() {
+        let Some(input_fields) = unsafe_relevance_inputs.get_mut(index) else {
+            continue;
+        };
+        for field in fields {
+            input_fields.insert(field.clone());
+            let distance = additional_distances
+                .get(index)
+                .and_then(|map| distance_for_exact_or_overlapping_field(map, &field))
+                .unwrap_or(0);
+            if let Some(input_distances) = distances.get_mut(index) {
+                update_min_distance(input_distances, field, distance);
+            }
+        }
+    }
+}
+
+fn distance_for_exact_or_overlapping_field(
+    distances: &FieldDistanceMap,
+    field: &FieldPath,
+) -> Option<u32> {
+    distances.get(field).copied().or_else(|| {
+        distances
+            .iter()
+            .filter(|(candidate, _)| paths_overlap(candidate, field))
+            .map(|(_, distance)| *distance)
+            .min()
+    })
 }
 
 fn update_min_distance(map: &mut FieldDistanceMap, path: FieldPath, distance: u32) {
@@ -2386,10 +2562,36 @@ impl<'tcx> Visitor<'tcx> for CallableCollector<'tcx> {
 #[cfg(test)]
 mod tests {
     use super::{
-        STD_ANNOTATED_PARAMS_JSON, doc_mentioned_params, extract_safety_section_from_docs,
+        FieldTransfer, FunctionFieldFacts, STD_ANNOTATED_PARAMS_JSON, TransferPoint, TransferRoot,
+        derive_unsafe_relevance_inputs, doc_mentioned_params, extract_safety_section_from_docs,
         function_param_list_from_snippet, function_param_name, std_annotated_params,
         unsafe_call_requires_all_args,
     };
+
+    #[test]
+    fn derives_unsafe_relevance_by_walking_transfers_backward() {
+        let mut facts = FunctionFieldFacts::new(2, true);
+        facts.unsafe_inputs[1].insert(vec![0]);
+        facts.transfers = vec![FieldTransfer {
+            src: TransferPoint {
+                root: TransferRoot::Param(0),
+                path: vec![1],
+            },
+            dst: TransferPoint {
+                root: TransferRoot::Param(1),
+                path: vec![0],
+            },
+            distance: 1,
+        }];
+
+        let (unsafe_relevance_inputs, distances) =
+            derive_unsafe_relevance_inputs(&facts.transfers, &facts, 2);
+
+        assert!(unsafe_relevance_inputs[0].contains(&vec![1]));
+        assert!(unsafe_relevance_inputs[1].contains(&vec![0]));
+        assert_eq!(distances[0].get(&vec![1]), Some(&1));
+        assert_eq!(distances[1].get(&vec![0]), Some(&0));
+    }
 
     #[test]
     fn extracts_relevant_params_from_safety_section() {

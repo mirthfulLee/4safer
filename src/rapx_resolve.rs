@@ -13,7 +13,9 @@ use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _
 use std::collections::{HashMap, HashSet};
 
 const MAX_TY_COMPLEXITY: usize = 6;
-const MAX_RESOLVE_ITERATIONS: usize = 10;
+const MAX_RESOLVE_ITERATIONS: usize = 1;
+const MAX_ACCUMULATED_MONOS_PER_FN: usize = 32;
+const MAX_NEW_TYS_PER_ITERATION: usize = 256;
 const MAX_IMPL_SEED_CANDIDATES: usize = 16;
 const MAX_IMPL_SEED_VARIANTS: usize = 32;
 
@@ -264,6 +266,12 @@ fn resolve_reachable_api_monos<'tcx>(
         });
 
         for (api_offset, fn_did) in generic_apis.iter().enumerate() {
+            if generic_map
+                .get(fn_did)
+                .is_some_and(|monos| monos.len() >= MAX_ACCUMULATED_MONOS_PER_FN)
+            {
+                continue;
+            }
             if api_offset % 50 == 0 {
                 debug!(
                     target: "foursafer::resolve",
@@ -315,6 +323,9 @@ fn resolve_reachable_api_monos<'tcx>(
                 if entry.contains(&mono) {
                     continue;
                 }
+                if entry.len() >= MAX_ACCUMULATED_MONOS_PER_FN {
+                    continue;
+                }
                 entry.push(mono);
                 if !output_ty.is_unit() {
                     new_tys.insert(output_ty);
@@ -323,6 +334,9 @@ fn resolve_reachable_api_monos<'tcx>(
         }
 
         let mut changed = false;
+        let mut new_tys = new_tys.into_iter().collect::<Vec<_>>();
+        new_tys.sort_by_key(|ty| (ty_complexity(*ty), ty.to_string()));
+        new_tys.truncate(MAX_NEW_TYS_PER_ITERATION);
         for ty in new_tys {
             changed |= type_candidates.insert_all(ty);
         }
@@ -473,8 +487,11 @@ fn resolve_fn_seed_monos<'tcx>(
     tcx: TyCtxt<'tcx>,
     trait_impl_candidates_cache: &mut HashMap<DefId, Vec<ty::TraitRef<'tcx>>>,
 ) -> Vec<Mono<'tcx>> {
+    let identity = ty::GenericArgs::identity_for_item(tcx, fn_did)
+        .iter()
+        .collect::<Vec<_>>();
     let mut seeds = vec![Mono {
-        value: ty::GenericArgs::identity_for_item(tcx, fn_did).to_vec(),
+        value: identity.clone(),
     }];
     let mut seen_seeds = seeds.iter().cloned().collect::<HashSet<_>>();
     if let Some(self_seeds) =
@@ -486,12 +503,93 @@ fn resolve_fn_seed_monos<'tcx>(
             }
         }
     }
-    for seed in resolve_trait_bound_seeds(fn_did, reachable_tys, tcx, trait_impl_candidates_cache) {
-        if seen_seeds.insert(seed.clone()) {
-            seeds.push(seed);
+    let input_params = input_constrained_type_params(fn_did, tcx);
+    if has_unconstrained_input_type_param(&identity, &input_params) {
+        for seed in
+            resolve_trait_bound_seeds(fn_did, reachable_tys, tcx, trait_impl_candidates_cache)
+        {
+            if !seed_binds_unconstrained_input_param(&identity, &seed, &input_params, tcx) {
+                continue;
+            }
+            if seen_seeds.insert(seed.clone()) {
+                seeds.push(seed);
+            }
         }
     }
     seeds
+}
+
+fn input_constrained_type_params<'tcx>(fn_did: DefId, tcx: TyCtxt<'tcx>) -> HashSet<ty::ParamTy> {
+    let fn_sig =
+        fn_sig_with_generic_args(fn_did, ty::GenericArgs::identity_for_item(tcx, fn_did), tcx);
+    let mut params = HashSet::new();
+    for input_ty in fn_sig.inputs() {
+        collect_input_type_params(*input_ty, &mut params);
+    }
+    params
+}
+
+fn collect_input_type_params<'tcx>(ty: Ty<'tcx>, params: &mut HashSet<ty::ParamTy>) {
+    match ty.kind() {
+        TyKind::Param(param) => {
+            params.insert(*param);
+        }
+        TyKind::Ref(_, inner, _) | TyKind::RawPtr(inner, _) | TyKind::Slice(inner) => {
+            collect_input_type_params(*inner, params);
+        }
+        TyKind::Array(inner, _) => collect_input_type_params(*inner, params),
+        TyKind::Tuple(types) => {
+            for ty in types.iter() {
+                collect_input_type_params(ty, params);
+            }
+        }
+        TyKind::Adt(_, args) => {
+            for ty in args.iter().filter_map(|arg| arg.as_type()) {
+                collect_input_type_params(ty, params);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn has_unconstrained_input_type_param<'tcx>(
+    identity: &[ty::GenericArg<'tcx>],
+    input_params: &HashSet<ty::ParamTy>,
+) -> bool {
+    identity.iter().any(|arg| {
+        arg.as_type().is_some_and(
+            |ty| matches!(ty.kind(), TyKind::Param(param) if !input_params.contains(param)),
+        )
+    })
+}
+
+fn seed_binds_unconstrained_input_param<'tcx>(
+    identity: &[ty::GenericArg<'tcx>],
+    seed: &Mono<'tcx>,
+    input_params: &HashSet<ty::ParamTy>,
+    tcx: TyCtxt<'tcx>,
+) -> bool {
+    identity
+        .iter()
+        .zip(seed.value.iter())
+        .any(|(identity_arg, seed_arg)| {
+            let Some(identity_ty) = identity_arg.as_type() else {
+                return false;
+            };
+            let TyKind::Param(identity_param) = identity_ty.kind() else {
+                return false;
+            };
+            if input_params.contains(identity_param) {
+                return false;
+            }
+
+            seed_arg.as_type().is_some_and(|seed_ty| {
+                !matches!(
+                    tcx.erase_and_anonymize_regions(seed_ty).kind(),
+                    TyKind::Param(_)
+                )
+            })
+        })
 }
 
 // For provided trait methods, seed the generic `Self` slot from concrete impls
