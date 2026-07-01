@@ -2,7 +2,7 @@ use super::*;
 use std::collections::BTreeMap;
 
 impl<'tcx, 'a> Planner<'tcx, 'a> {
-    /// Collect all API instances that are valid obligation-driven targets
+    /// Collect all API instances that are valid unsafe-flow targets
     /// before representative-shape capping.
     pub(super) fn collect_unsafe_flow_targets(&self) -> Vec<usize> {
         self.apis

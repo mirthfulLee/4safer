@@ -21,19 +21,31 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from experiment_common import (
+    DEFAULT_EXPERIMENT,
+    DEFAULT_EXPERIMENT_CONFIG,
+    DEFAULT_EXPERIMENT_ROOT,
+    REPO,
+    analysis_out_path,
+    execution_base_path,
+    generation_results_path,
+    load_experiment_config,
+    repo_path,
+    unsoundness_cases_path,
+)
 
-REPO = Path(__file__).resolve().parents[1]
-DEFAULT_EXPERIMENT_ROOT = REPO / "tmp/paper-experiments"
-DEFAULT_GENERATION = DEFAULT_EXPERIMENT_ROOT / "runs/all_results.csv"
-DEFAULT_EXEC_BASE = DEFAULT_EXPERIMENT_ROOT / "backend-execution/obligation-sequence"
-DEFAULT_UNSOUNDNESS_CASES = DEFAULT_EXPERIMENT_ROOT / "backend-execution/unsoundness_cases.csv"
-DEFAULT_OUT_DIR = DEFAULT_EXPERIMENT_ROOT / "final_backend_summaries"
+DEFAULT_GENERATION = DEFAULT_EXPERIMENT_ROOT / "runs" / DEFAULT_EXPERIMENT / "all_results.csv"
+DEFAULT_EXEC_BASE = DEFAULT_EXPERIMENT_ROOT / "backend-execution" / DEFAULT_EXPERIMENT
+DEFAULT_UNSOUNDNESS_CASES = (
+    DEFAULT_EXPERIMENT_ROOT / "backend-execution" / DEFAULT_EXPERIMENT / "unsoundness_cases.csv"
+)
+DEFAULT_OUT_DIR = DEFAULT_EXPERIMENT_ROOT / "final_backend_summaries" / DEFAULT_EXPERIMENT
 DEFAULT_GENERATION_BACKEND = "tests"
-DEFAULT_EXPERIMENT_CONFIG = REPO / "scripts/config/budgeted.json"
 
 RUN_BACKENDS = {
     "asan": "tests-asan",
     "miri": "tests-miri",
+    "fuzz": "fuzz-asan",
 }
 
 HIGH_CONFIDENCE_UNSOUNDNESS = {
@@ -46,6 +58,7 @@ HIGH_CONFIDENCE_UNSOUNDNESS = {
     "out_of_bounds",
     "use_after_free",
     "misaligned_access",
+    "undefined_behavior_sanitizer",
 }
 
 
@@ -174,64 +187,33 @@ def parse_args():
 
 
 def load_analyze_defaults(path):
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    paths = payload.get("paths", {})
-    if not isinstance(paths, dict):
-        raise SystemExit(f"{path} paths must be an object")
+    payload = load_experiment_config(path)
     analyze = payload.get("analyze", {})
-    if not isinstance(analyze, dict):
-        raise SystemExit(f"{path} analyze must be an object")
-    experiment = payload.get("experiment") or "obligation-sequence"
+    experiment = payload.get("experiment") or DEFAULT_EXPERIMENT
     generation = repo_path(
         analyze.get("generation")
-        or paths.get("generation_results")
-        or derived_generation_results(paths),
+        or generation_results_path(payload, experiment),
         DEFAULT_GENERATION,
     )
     execution_base = repo_path(
         analyze.get("execution_base")
-        or paths.get("execution_base")
-        or derived_execution_base(paths, experiment),
+        or execution_base_path(payload, experiment),
         DEFAULT_EXEC_BASE,
     )
     return {
         "generation": generation,
         "execution_base": execution_base,
         "unsoundness_cases": repo_path(
-            analyze.get("unsoundness_cases") or paths.get("unsoundness_cases"),
+            analyze.get("unsoundness_cases") or unsoundness_cases_path(payload, experiment),
             DEFAULT_UNSOUNDNESS_CASES,
         ),
         "out_dir": repo_path(
-            analyze.get("out_dir") or paths.get("analysis_out"),
+            analyze.get("out_dir") or analysis_out_path(payload, experiment),
             DEFAULT_OUT_DIR,
         ),
         "generation_backend": analyze.get("generation_backend") or DEFAULT_GENERATION_BACKEND,
         "run_backends": parse_analyze_run_backends(analyze.get("run_backends")),
     }
-
-
-def derived_generation_results(paths):
-    generation_out = paths.get("generation_out")
-    if generation_out is None:
-        return None
-    return str(Path(generation_out) / "all_results.csv")
-
-
-def derived_execution_base(paths, experiment):
-    execution_out = paths.get("execution_out")
-    if execution_out is None:
-        return None
-    return str(Path(execution_out) / experiment)
-
-
-def repo_path(value, default):
-    if value is None:
-        return default
-    path = Path(value)
-    if path.is_absolute():
-        return path
-    return REPO / path
 
 
 def parse_analyze_run_backends(value):
@@ -275,43 +257,35 @@ def load_unsoundness_index(config, generation):
     crashes = defaultdict(int)
     panics = defaultdict(int)
     unique_panics = defaultdict(set)
+    seen_cases = set()
 
-    if not config.unsoundness_cases.exists():
-        return {
-            "raw_counts": raw_counts,
-            "unique": unique,
-            "kind_counts": kind_counts,
-            "unique_kind_counts": unique_kind_counts,
-            "unique_sources": unique_sources,
-            "crashes": crashes,
-            "panics": panics,
-            "unique_panics": unique_panics,
-        }
-
-    with config.unsoundness_cases.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            backend = row.get("backend") or ""
-            key = row.get("crate_key") or crate_key(row)
-            if is_crash_exit(row.get("status"), row.get("exit_code")):
-                crashes[(backend, key)] += 1
-            text = case_text(row, force_full=False)
+    for row in iter_unsoundness_rows(config):
+        case_id = unsoundness_case_id(row)
+        if case_id in seen_cases:
+            continue
+        seen_cases.add(case_id)
+        backend = row.get("backend") or ""
+        key = row.get("crate_key") or crate_key(row)
+        if is_crash_exit(row.get("status"), row.get("exit_code")):
+            crashes[(backend, key)] += 1
+        text = case_text(row, force_full=False)
+        kind = classify_case(text, row.get("classification"), row.get("status"), row.get("exit_code"))
+        if should_read_full_case_text(row, kind, text):
+            text = case_text(row, force_full=True)
             kind = classify_case(text, row.get("classification"), row.get("status"), row.get("exit_code"))
-            if should_read_full_case_text(row, kind, text):
-                text = case_text(row, force_full=True)
-                kind = classify_case(text, row.get("classification"), row.get("status"), row.get("exit_code"))
-            target_api = target_api_for_case(row, key, generation, suite_targets)
-            if kind == "panic":
-                panics[(backend, key)] += 1
-                unique_panics[(backend, key)].add(panic_fingerprint(backend, key, target_api, text))
-            if kind not in HIGH_CONFIDENCE_UNSOUNDNESS:
-                continue
-            source = unsoundness_source(row, key, kind, text)
-            fingerprint = unsoundness_fingerprint(backend, key, kind, target_api, source)
-            raw_counts[(backend, key)] += 1
-            unique[(backend, key)].add(fingerprint)
-            kind_counts[(backend, key)][kind] += 1
-            unique_kind_counts[(backend, key)][kind].add(fingerprint)
-            unique_sources[(backend, key)].add(f"{target_api}@{kind}@{source}")
+        target_api = target_api_for_case(row, key, generation, suite_targets)
+        if kind == "panic":
+            panics[(backend, key)] += 1
+            unique_panics[(backend, key)].add(panic_fingerprint(backend, key, target_api, text))
+        if kind not in HIGH_CONFIDENCE_UNSOUNDNESS:
+            continue
+        source = unsoundness_source(row, key, kind, text)
+        fingerprint = unsoundness_fingerprint(backend, key, kind, target_api, source)
+        raw_counts[(backend, key)] += 1
+        unique[(backend, key)].add(fingerprint)
+        kind_counts[(backend, key)][kind] += 1
+        unique_kind_counts[(backend, key)][kind].add(fingerprint)
+        unique_sources[(backend, key)].add(f"{target_api}@{kind}@{source}")
 
     return {
         "raw_counts": raw_counts,
@@ -323,6 +297,121 @@ def load_unsoundness_index(config, generation):
         "panics": panics,
         "unique_panics": unique_panics,
     }
+
+
+def iter_unsoundness_rows(config):
+    if config.unsoundness_cases.exists():
+        with config.unsoundness_cases.open(newline="", encoding="utf-8") as handle:
+            yield from csv.DictReader(handle)
+    for backend in config.run_backends.values():
+        if backend.startswith("fuzz"):
+            yield from iter_fuzz_unsoundness_rows(backend, config)
+
+
+def iter_fuzz_unsoundness_rows(backend, config):
+    for result_path in iter_backend_result_paths(backend, config):
+        try:
+            result = json.loads(result_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        target_results_path = result.get("fuzz_target_results_path")
+        if not target_results_path:
+            continue
+        target_results_path = Path(target_results_path)
+        try:
+            target_results = json.loads(target_results_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+        for target in target_results:
+            yield from fuzz_target_unsoundness_rows(result, result_path, target_results_path, target)
+
+
+def fuzz_target_unsoundness_rows(result, result_path, target_results_path, target):
+    target_name = target.get("name") or ""
+    for source, status, exit_code, stdout_tail, stderr_tail in fuzz_target_observations(target):
+        if not fuzz_observation_failed(status, exit_code):
+            continue
+        kind = classify_case(
+            "\n".join(part for part in (stdout_tail, stderr_tail) if part),
+            target.get("unsoundness_kind"),
+            status,
+            exit_code,
+        )
+        if kind not in HIGH_CONFIDENCE_UNSOUNDNESS:
+            continue
+        yield {
+            "crate": result.get("crate"),
+            "version": result.get("version"),
+            "crate_key": crate_key(result),
+            "backend": result.get("backend") or "fuzz",
+            "test": f"{target_name}:{source}",
+            "status": status,
+            "exit_code": exit_code,
+            "elapsed_sec": target.get("elapsed_sec"),
+            "classification": kind,
+            "first_error": target.get("first_error") or "",
+            "stderr_tail": (stderr_tail or "")[:1000],
+            "stdout_tail": (stdout_tail or "")[:1000],
+            "stdout_log": target.get("stdout_log"),
+            "stderr_log": target.get("stderr_log"),
+            "result_json": str(result_path),
+            "test_results_json": str(target_results_path),
+        }
+
+
+def fuzz_target_observations(target):
+    observations = [
+        (
+            "fuzz",
+            target.get("status"),
+            target.get("exit_code"),
+            target.get("stdout_tail") or "",
+            target.get("stderr_tail") or "",
+        )
+    ]
+    early_stop_info = target.get("fuzz_early_stop_info") or {}
+    if early_stop_info:
+        observations.append(
+            (
+                "early-stop-replay",
+                "fail",
+                early_stop_info.get("replay_exit_code"),
+                early_stop_info.get("replay_stdout_tail") or "",
+                early_stop_info.get("replay_stderr_tail") or "",
+            )
+        )
+    for seed in target.get("seed_validation_results") or []:
+        observations.append(
+            (
+                f"seed:{seed.get('name')}",
+                seed.get("status"),
+                seed.get("exit_code"),
+                seed.get("stdout_tail") or "",
+                seed.get("stderr_tail") or "",
+            )
+        )
+    return observations
+
+
+def fuzz_observation_failed(status, exit_code):
+    if status in {"fail", "crash", "timeout"}:
+        return True
+    try:
+        code = int(float(exit_code or 0))
+    except ValueError:
+        return False
+    return code != 0
+
+
+def unsoundness_case_id(row):
+    return (
+        row.get("backend") or "",
+        row.get("crate_key") or crate_key(row),
+        row.get("test") or "",
+        row.get("status") or "",
+        str(row.get("exit_code") or ""),
+        row.get("classification") or "",
+    )
 
 
 def load_suite_target_index(generation):
@@ -406,7 +495,8 @@ def should_read_full_case_text(row, kind, text):
 def should_allow_full_log(row):
     if row.get("status") == "timeout":
         return False
-    return row.get("backend") in {"tests-miri", "tests-asan"}
+    backend = row.get("backend") or ""
+    return backend in {"tests-miri", "tests-asan"} or backend.startswith("fuzz")
 
 
 def target_api_for_case(row, key, generation, suite_targets):
@@ -419,6 +509,9 @@ def target_api_for_case(row, key, generation, suite_targets):
 
 
 def suite_index(test_name):
+    match = re.search(r"fuzz_target_(\d+)(?::|$)", test_name or "")
+    if match:
+        return int(match.group(1))
     match = re.search(r"generated_test_(\d+)", test_name or "")
     if match:
         return int(match.group(1))
@@ -464,6 +557,8 @@ def classify_case(text, original_kind, status, exit_code):
         return "memory_sanitizer"
     if "threadsanitizer" in lowered or "data race" in lowered:
         return "thread_sanitizer"
+    if "undefinedbehaviorsanitizer" in lowered or "runtime error:" in lowered:
+        return "undefined_behavior_sanitizer"
     if "undefined behavior" in lowered:
         if "misaligned" in lowered or "alignment" in lowered:
             return "misaligned_access"
@@ -602,8 +697,18 @@ def normalized_error_message(text):
     return normalized[:500]
 
 
+def target_api_key(key, target_api):
+    return (key, normalize_target_api(target_api))
+
+
 def unsoundness_fingerprint(backend, key, kind, target_api, source):
-    return (backend, key, target_api)
+    return (backend, *target_api_key(key, target_api))
+
+
+def cross_backend_unsoundness_key(fingerprint):
+    if isinstance(fingerprint, tuple) and len(fingerprint) >= 3:
+        return fingerprint[1:3]
+    return fingerprint
 
 
 def panic_fingerprint(backend, key, target_api, text):
@@ -623,10 +728,20 @@ def build_backend_rows(label, backend, generation, unsoundness, config):
 
 def load_result_rows(backend, config):
     rows = {}
-    for path in sorted((config.execution_base / backend).glob("*/result.json")):
+    for path in iter_backend_result_paths(backend, config):
         row = json.loads(path.read_text())
         rows[crate_key(row)] = row
     return rows
+
+
+def iter_backend_result_paths(backend, config):
+    seen = set()
+    for path in sorted((config.execution_base / backend).glob("*/result.json")):
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        yield resolved
 
 
 def summary_row(label, backend, key, gen, result, unsoundness):
@@ -643,14 +758,14 @@ def summary_row(label, backend, key, gen, result, unsoundness):
         "synthesis_time_sec": synthesis_elapsed,
         "execution_time_sec": execution_elapsed,
         "total_time_sec": round(synthesis_elapsed + execution_elapsed, 3),
-        "available_suites": inum(result.get("available_generated_tests")),
-        "selected_suites": inum(result.get("selected_generated_tests")),
-        "passed": inum(result.get("tests_passed")),
-        "failed": inum(result.get("tests_failed")),
-        "timeout": inum(result.get("tests_timeout")),
+        "available_suites": result_available_suites(backend, result),
+        "selected_suites": result_selected_suites(backend, result),
+        "passed": result_passed(backend, result),
+        "failed": result_failed(backend, result),
+        "timeout": result_timeout(backend, result),
         "run_failed": int(status == "fail"),
         "run_timeout": int(status == "timeout"),
-        "crashes": unsoundness["crashes"][(backend, key)],
+        "crashes": result_crashes(backend, result, unsoundness["crashes"][(backend, key)]),
         "alarms": unsoundness["raw_counts"][(backend, key)],
         "unique_alarms": len(unsoundness["unique"][(backend, key)]),
         "panics": unsoundness["panics"][(backend, key)],
@@ -661,9 +776,51 @@ def summary_row(label, backend, key, gen, result, unsoundness):
         "raw_unsoundness_kinds": format_kind_counts(unsoundness["kind_counts"][(backend, key)]),
         "compile_exit_code": result.get("compile_exit_code", ""),
         "exit_code": result.get("exit_code", ""),
-        "test_timeout_sec": result.get("test_timeout_sec", ""),
+        "test_timeout_sec": result_timeout_sec(backend, result),
         "first_error": result.get("first_error") or "",
     }
+
+
+def result_available_suites(backend, result):
+    if backend.startswith("fuzz"):
+        return inum(result.get("fuzz_targets_available"))
+    return inum(result.get("available_generated_tests"))
+
+
+def result_selected_suites(backend, result):
+    if backend.startswith("fuzz"):
+        return inum(result.get("fuzz_targets_executed"))
+    return inum(result.get("selected_generated_tests"))
+
+
+def result_passed(backend, result):
+    if backend.startswith("fuzz"):
+        return inum(result.get("fuzz_targets_ok"))
+    return inum(result.get("tests_passed"))
+
+
+def result_failed(backend, result):
+    if backend.startswith("fuzz"):
+        return inum(result.get("fuzz_targets_fail"))
+    return inum(result.get("tests_failed"))
+
+
+def result_timeout(backend, result):
+    if backend.startswith("fuzz"):
+        return inum(result.get("fuzz_targets_timeout"))
+    return inum(result.get("tests_timeout"))
+
+
+def result_timeout_sec(backend, result):
+    if backend.startswith("fuzz"):
+        return result.get("fuzz_target_timeout_sec", "")
+    return result.get("test_timeout_sec", "")
+
+
+def result_crashes(backend, result, fallback):
+    if backend.startswith("fuzz"):
+        return inum(result.get("fuzz_crashes"))
+    return fallback
 
 
 def total_row(label, backend, rows):
@@ -713,6 +870,11 @@ def build_experiment_rows(generation, backend_rows, unsoundness, config):
     rows = []
     for key in sorted(generation, key=crate_sort_key):
         gen = generation[key]
+        cross_backend_count = cross_backend_unsoundness_count(
+            unsoundness,
+            config.run_backends.values(),
+            key,
+        )
         row = {
             "crate": gen.get("crate"),
             "version": gen.get("version"),
@@ -727,7 +889,8 @@ def build_experiment_rows(generation, backend_rows, unsoundness, config):
             "unique_alarms": 0,
             "panics": 0,
             "unique_panics": 0,
-            "unsoundness": combined_unsoundness_count(unsoundness, config.run_backends.values(), key),
+            "unsoundness": cross_backend_count,
+            "cross_backend_unsoundness": cross_backend_count,
             "time_sec": fnum(gen.get("elapsed_sec")),
         }
         status_parts = []
@@ -737,13 +900,13 @@ def build_experiment_rows(generation, backend_rows, unsoundness, config):
             prefix = sanitize_column_prefix(label)
             status = backend_summary.get("execution_status") or result.get("status") or "missing"
             row[f"{prefix}_status"] = status
-            row[f"{prefix}_suites"] = inum(result.get("selected_generated_tests")) or inum(
+            row[f"{prefix}_suites"] = result_selected_suites(backend, result) or inum(
                 backend_summary.get("selected_suites")
             )
             row["suites"] = max(row["suites"], row[f"{prefix}_suites"])
-            row[f"{prefix}_passed"] = inum(result.get("tests_passed"))
-            row[f"{prefix}_failed"] = inum(result.get("tests_failed"))
-            row[f"{prefix}_timeout"] = inum(result.get("tests_timeout"))
+            row[f"{prefix}_passed"] = result_passed(backend, result)
+            row[f"{prefix}_failed"] = result_failed(backend, result)
+            row[f"{prefix}_timeout"] = result_timeout(backend, result)
             row[f"{prefix}_alarms"] = unsoundness["raw_counts"][(backend, key)]
             row[f"{prefix}_unique_alarms"] = len(unsoundness["unique"][(backend, key)])
             row[f"{prefix}_panics"] = unsoundness["panics"][(backend, key)]
@@ -765,25 +928,33 @@ def build_experiment_rows(generation, backend_rows, unsoundness, config):
         row["time_sec"] = round(row["time_sec"], 3)
         row["synthesis_time_sec"] = round(row["synthesis_time_sec"], 3)
         rows.append(row)
-    rows.append(total_experiment_row(rows, config))
+    rows.append(total_experiment_row(rows, generation, unsoundness, config))
     return rows
 
 
-def combined_unsoundness_count(unsoundness, backends, key):
+def cross_backend_unsoundness_count(unsoundness, backends, key):
     unique_targets = set()
     for backend in backends:
         for fingerprint in unsoundness["unique"][(backend, key)]:
-            unique_targets.add(combined_unsoundness_fingerprint(fingerprint))
+            unique_targets.add(cross_backend_unsoundness_key(fingerprint))
     return len(unique_targets)
 
 
-def combined_unsoundness_fingerprint(fingerprint):
-    if isinstance(fingerprint, tuple) and len(fingerprint) >= 3:
-        return fingerprint[2]
-    return fingerprint
+def cross_backend_unsoundness_total(unsoundness, backends, keys):
+    unique_targets = set()
+    for key in keys:
+        for backend in backends:
+            for fingerprint in unsoundness["unique"][(backend, key)]:
+                unique_targets.add(cross_backend_unsoundness_key(fingerprint))
+    return len(unique_targets)
 
 
-def total_experiment_row(rows, config):
+def total_experiment_row(rows, generation, unsoundness, config):
+    cross_backend_count = cross_backend_unsoundness_total(
+        unsoundness,
+        config.run_backends.values(),
+        generation.keys(),
+    )
     total = {
         "crate": "total",
         "version": "",
@@ -799,7 +970,8 @@ def total_experiment_row(rows, config):
         "unique_alarms": sum(inum(row["unique_alarms"]) for row in rows),
         "panics": sum(inum(row["panics"]) for row in rows),
         "unique_panics": sum(inum(row["unique_panics"]) for row in rows),
-        "unsoundness": sum(inum(row["unsoundness"]) for row in rows),
+        "unsoundness": cross_backend_count,
+        "cross_backend_unsoundness": cross_backend_count,
         "time_sec": round(sum(fnum(row["time_sec"]) for row in rows), 3),
     }
     for label in config.run_backends:
@@ -872,9 +1044,9 @@ def verify_backend_rows(label, backend, rows, generation, config):
     result_rows = load_result_rows(backend, config)
     result_sums = {
         "execution_time_sec": sum(fnum(row.get("elapsed_sec")) for row in result_rows.values()),
-        "passed": sum(inum(row.get("tests_passed")) for row in result_rows.values()),
-        "failed": sum(inum(row.get("tests_failed")) for row in result_rows.values()),
-        "timeout": sum(inum(row.get("tests_timeout")) for row in result_rows.values()),
+        "passed": sum(result_passed(backend, row) for row in result_rows.values()),
+        "failed": sum(result_failed(backend, row) for row in result_rows.values()),
+        "timeout": sum(result_timeout(backend, row) for row in result_rows.values()),
     }
     for field, expected in result_sums.items():
         got = fnum(total.get(field))
@@ -887,11 +1059,7 @@ def verify_backend_rows(label, backend, rows, generation, config):
             f"suites_synthesized: generation sum {expected_suites} != total {total.get('suites_synthesized')}"
         )
 
-    unsoundness_text = (
-        str(total.get("unsoundness_kinds") or "")
-        + ";"
-        + str(total.get("unsoundness_sources") or "")
-    ).lower()
+    unsoundness_text = str(total.get("unsoundness_kinds") or "").lower()
     if "panic" in unsoundness_text or "overflow" in unsoundness_text:
         errors.append("panic/overflow appeared in counted unsoundness columns")
 
@@ -1070,6 +1238,7 @@ def write_experiment_csv(path, rows):
         "panics",
         "unique_panics",
         "unsoundness",
+        "cross_backend_unsoundness",
         "synthesis_time_sec",
         "time_sec",
     ]

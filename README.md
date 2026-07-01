@@ -1,143 +1,129 @@
-# cargo-4safer
+# cargo-4safer Reproduction Package
 
-`cargo 4safer` synthesizes obligation-driven verification suites for Rust
-library crates. The project is the standalone extraction of the
-`obligation_driven` synthesis flow: target discovery is driven by MIR unsafe
-effect propagation, sequence planning is fixed to the obligation-driven planner,
-and generated metadata is written next to the harness crate for validation.
+This package contains the `cargo 4safer` tool and the scripts used to reproduce
+the paper experiments. `cargo 4safer` synthesizes verification suites for Rust
+library crates by finding public safe APIs that directly or transitively reach
+unsafe code, building a rustc-derived API dependency graph, and rendering
+generated harnesses for Rust tests, Kani, and AFL fuzzing.
 
-## Status
+The default synthesis mode is budgeted obligation-driven planning. The
+unbudgeted mode is exposed only for ablation through `--disable-budget-limit`
+or `--unbudgeted`.
 
-- The user-facing entry point is `cargo 4safer`.
-- The implementation runs `cargo check --lib` with this binary as
-  `RUSTC_WRAPPER`, then enters an in-process rustc callback for the primary
-  library target.
-- MIR unsafe-surface analysis classifies direct and propagated unsafe-effect
-  public APIs before planning.
-- The RAPx-derived API dependency graph is built directly through rustc and
-  resolved into bounded generic mono instances.
-- Suite synthesis always uses the obligation-driven planner.
-- The default generated crate is `foursafer_test`.
-- The default backend is `tests`; `kani` and `fuzz` can still be selected with
-  `--backend`.
-- Ranking ablation is controlled by `--disable-ranking`.
-- Metadata is written under `foursafer_meta`.
+## Package Layout
 
-Contract extraction for unsafe calls and pointer operations remains a
-placeholder in the MIR analysis layer. The current planner should not be
-presented as full precondition recovery.
+```text
+.
+  Cargo.toml
+  Cargo.lock
+  rust-toolchain.toml
+  src/
+    cargo_phase.rs       cargo subcommand entry point and rustc-wrapper setup
+    driver.rs            rustc callback entry point
+    pipeline.rs          graph construction, unsafe analysis, and rendering flow
+    rapx_graph.rs        rustc-side API dependency graph construction
+    rapx_resolve.rs      reachable-type iteration and API monomorphization
+    rapx_mono.rs         bounded generic argument solving
+    unsafe_analysis.rs   MIR unsafe-effect propagation summaries
+    synth/               obligation-driven target selection and planning
+    backend/             tests, Kani, and fuzz harness renderers
+  data/
+    std_annotated_params.json
+  misc/
+    trophy_crates.csv
+    popular_crates_with_unsafe.csv
+  scripts/
+    suite_synthesize.py  generate harness suites and synthesis metrics
+    suite_execute.py     run generated tests, Kani, or fuzz harnesses
+    result_analyze.py    build final experiment summary CSV files
+    plot_sequence_length_distribution.py
+    config/*.json        experiment profiles and output paths
+  Dockerfile.experiments
+```
 
-## Usage
+Generated experiment artifacts are written under `tmp/paper-experiments/` by
+default.
 
-Run `cargo 4safer -h` to see the full flag list.
+## Requirements
 
-## Install
-
-`cargo-4safer` uses `rustc_private`, so install it with the pinned nightly and
-the matching `rustc-dev` component:
+The core tool requires the pinned nightly compiler because it uses
+`rustc_private` APIs.
 
 ```bash
 rustup toolchain install nightly-2026-03-26 --component rustc-dev
-cargo +nightly-2026-03-26 install \
-  --git git@github.com:mirthfulLee/4safer.git \
-  --branch master \
-  --locked
+cargo +nightly-2026-03-26 build --bin cargo-4safer --locked
 ```
 
-For a local checkout:
+For the full backend experiments, install or provide:
+
+- Python 3.10 or newer.
+- Docker, if using the supplied experiment container.
+- AFL support through `cargo afl` for fuzz experiments.
+- Kani, CBMC, `goto-cc`, and `goto-instrument` for Kani experiments.
+- The Rust `miri` component for Miri execution.
+
+The container helper expects a built Kani checkout at
+`tmp/paper-experiments/tools/kani` by default. Override it with `KANI_HOST_DIR`
+when needed.
+
+## Using the Tool
+
+Build or install the local checkout:
 
 ```bash
 cargo +nightly-2026-03-26 install --path . --locked
 ```
 
-Generate the default Rust test backend for a crate directory:
-
-```bash
-cargo 4safer -C /path/to/crate
-```
-
-Generate from a manifest path:
-
-```bash
-cargo 4safer -m /path/to/crate/Cargo.toml
-```
-
-Select a workspace member explicitly:
-
-```bash
-cargo 4safer -C /path/to/workspace -p my-lib
-```
-
-Write the generated harness crate somewhere else:
+Generate the default Rust test backend for a library crate:
 
 ```bash
 cargo 4safer -C /path/to/crate -o /tmp/my-4safer-suite
 ```
 
-Build-check the generated harness after synthesis:
+Select a workspace member:
+
+```bash
+cargo 4safer -C /path/to/workspace -p my-lib
+```
+
+Run generated-crate validation after synthesis:
 
 ```bash
 cargo 4safer -C /path/to/crate --check-harness
 ```
 
-Run without heuristic sequence ranking for ablation:
-
-```bash
-cargo 4safer -C /path/to/crate --disable-ranking
-```
-
-Render a non-default backend:
+Render Kani or fuzz harnesses:
 
 ```bash
 cargo 4safer -C /path/to/crate -b kani
 cargo 4safer -C /path/to/crate -b fuzz
 ```
 
-Cargo feature flags are forwarded to analysis and to the generated harness
-dependency:
+Forward target-crate feature flags:
 
 ```bash
 cargo 4safer -C /path/to/crate --features extra
 cargo 4safer -C /path/to/crate --all-features
-```
-
-Extra `cargo check` flags can be passed after `--`:
-
-```bash
 cargo 4safer -C /path/to/crate -- --features extra
 ```
 
-Common options:
+Important synthesis controls:
 
-- `-C, --dir <DIR>`: crate directory.
-- `-m, --manifest-path <PATH>`: crate manifest path.
-- `-p, --package <SPEC>`: workspace package.
-- `-o, --out <PATH>`: generated harness output directory.
-- `-b, --backend <BACKEND>`: `tests`, `kani`, or `fuzz`; repeat or use comma
-  separated values for multiple backends.
-- `-c, --check-harness`: run a quick generated-crate validation step.
-- `-d, --max-depth <CALLS>`: max call count per sequence; `0` means unlimited.
-- `-M, --max-mutators <N>`: maximum extra mutator rounds per target sequence.
-- `--max-sequences <COUNT>`: max generated sequences in the whole suite; `0`
-  means unlimited.
-- `--max-sequences-per-wrapper <COUNT>`: max generated sequences per unsafe
-  wrapper group.
-- `--max-sequences-per-target <COUNT>`: max generated sequences per obligation
-  target.
-- `--floor-sequences-per-target <COUNT>`: sequence budget for
-  one target with multiple obligated parameters; default `16`.
-- `--disable-ranking`: accept generated sequences in construction order while
-  keeping the same sequence budgets.
-- `--r-flow <VALUE>`: flow decay ratio in sequence ranking; default `0.5`.
-- `--w-c <VALUE>`: construction-cost weight in sequence ranking; default `0.1`.
-- `--w-p <VALUE>`: diversity-penalty weight in sequence ranking; default `0.2`.
-- `--disable-reuse-penalty`: disable mutator reuse penalty for ablation.
-- `--disable-depth-penalty`: disable depth saturation and stagnation penalties
-  for ablation.
+- `--max-mutators <N>`: maximum extra mutator rounds per target sequence.
+- `--max-depth <CALLS>`: maximum call count per sequence; `0` means unlimited.
+- `--max-sequences <COUNT>`: whole-suite sequence budget; `0` means unlimited.
+- `--max-sequences-per-wrapper <COUNT>`: per unsafe-wrapper group budget.
+- `--max-sequences-per-target <COUNT>`: per obligation-target budget.
+- `--floor-sequences-per-target <COUNT>`: budget floor for targets with
+  multiple obligated parameters.
+- `--disable-ranking`: ranking ablation.
+- `--disable-reuse-penalty`: mutator reuse penalty ablation.
+- `--disable-depth-penalty`: depth penalty ablation.
+- `--disable-budget-limit` or `--unbudgeted`: unbudgeted planning ablation.
 
-## Generated Layout
+## Generated Harness Layout
 
-For the default `tests` backend, the output is a standalone harness crate:
+For the default `tests` backend, the output is a standalone crate:
 
 ```text
 <harness-dir>/
@@ -147,43 +133,29 @@ For the default `tests` backend, the output is a standalone harness crate:
     lib.rs
     test_<crate_name>0.rs
     test_<crate_name>1.rs
-    ...
   foursafer_meta/
     <crate_name>_api_functions.json
     <crate_name>_api_sequences.json
     <crate_name>_target_summaries.json
 ```
 
-The optional `fuzz` backend also writes AFL targets and seed corpora:
+When multiple backends are requested, each backend is rendered below a backend
+subdirectory of the requested output root. The fuzz backend also emits
+`fuzz_targets/` and `corpus/` directories.
 
-```text
-  .cargo/config.toml
-  fuzz_targets/
-    fuzz_target_0.rs
-    ...
-  corpus/
-    fuzz_target_0/
-      seed
-```
-
-When multiple backends are requested, each backend is rendered under a
-subdirectory of the requested output directory.
-
-## Running Generated Suites
-
-The default backend emits ordinary Rust tests:
+Run generated test suites with:
 
 ```bash
 cargo test --manifest-path /path/to/foursafer_test/Cargo.toml
 ```
 
-Kani backend output can be checked with:
+Run generated Kani suites with:
 
 ```bash
 cargo kani --manifest-path /path/to/foursafer_test/Cargo.toml
 ```
 
-The fuzz backend emits AFL binary targets:
+Build and run one generated AFL target with:
 
 ```bash
 cargo afl build --manifest-path /path/to/foursafer_test/Cargo.toml --bin fuzz_target_0
@@ -194,25 +166,110 @@ cargo afl fuzz \
   -- /path/to/foursafer_test/target/debug/fuzz_target_0
 ```
 
-## Design Notes
+## Reproducing the Experiments
 
-- Target selection includes direct unsafe-block wrappers and MIR-propagated
-  indirect unsafe targets.
-- Relationships are established from MIR dataflow through assignments,
-  temporaries, returns, and call arguments, not plain call reachability.
-- Field-sensitive summaries filter constructor and mutator choices so unrelated
-  field-only APIs are not pulled into a target sequence.
-- APIs that transitively invoke unsafe code without writing back into relevant
-  object fields can still be targets, but they should not become broad mutators
-  merely because they take `&mut self`.
-- Generic resolution is rustc-direct only. Do not reintroduce rustdoc
-  `clean::Type` matching.
+The reproduction workflow has three stages:
 
-## Toolchain
+1. Synthesize suites and collect generation metrics.
+2. Execute generated backend harnesses.
+3. Aggregate backend results into final summary CSV files.
 
-The repo is pinned to `nightly-2026-03-26` because the graph builder relies on
-`rustc_private` plus `rustc-dev`.
+Experiment profiles live in `scripts/config/`. The main profiles are:
 
-Child `cargo metadata`, `cargo check`, lockfile generation, and
-`--check-harness` validation inherit the active `RUSTUP_TOOLCHAIN` so the target
-crate is analyzed with the same compiler selection that launched `cargo 4safer`.
+- `budgeted.json`: default budgeted obligation-driven synthesis.
+- `no_ranking.json`: ranking ablation.
+
+Each config defines the crate CSV, source checkout directory, generation output,
+backend execution output, and final analysis output. Relative paths are resolved
+from the repository root.
+
+### Optional Container
+
+Build the experiment container:
+
+```bash
+scripts/build_experiment_container.sh
+```
+
+Run any reproduction command inside the container:
+
+```bash
+scripts/run_in_experiment_container.sh bash -lc '<command>'
+```
+
+The helper mounts the repository at `/workspace/4safer` and stores container
+home/cache state under `tmp/experiment-container-home`.
+
+### Stage 1: Suite Synthesis
+
+Run the main budgeted experiment over `misc/trophy_crates.csv`:
+
+```bash
+python3 scripts/suite_synthesize.py --experiment budgeted
+```
+
+Default synthesis output for the budgeted profile:
+
+```text
+tmp/paper-experiments/runs/budgeted/
+  all_results.csv
+  summary_by_config_backend.csv
+  <backend>/<crate-version>/result.json
+  multi-kani-tests-fuzz/<crate-version>/harness/
+```
+
+### Stage 2: Backend Execution
+
+Execute the generated harnesses using the named runs from the experiment config:
+
+```bash
+python3 scripts/suite_execute.py --experiment-config scripts/config/budgeted.json --run tests-asan
+# other options: tests-miri, fuzz-asan, kani
+```
+
+Run only one crate:
+
+```bash
+python3 scripts/suite_execute.py \
+  --experiment-config scripts/config/budgeted.json \
+  --run tests-asan \
+  --crate bson-0.13.0
+```
+
+Refresh execution summaries from existing backend result files:
+
+```bash
+python3 scripts/suite_execute.py \
+  --experiment-config scripts/config/budgeted.json \
+  --aggregate-existing
+```
+
+Default execution output for the budgeted profile:
+
+```text
+tmp/paper-experiments/backend-execution/budgeted/
+  summary_by_backend.csv
+  unsoundness_cases.csv
+  tests-asan/<crate-version>/result.json
+  tests-miri/<crate-version>/result.json
+  fuzz-asan/<crate-version>/result.json
+  kani/<crate-version>/result.json
+```
+
+### Stage 3: Final Summaries
+
+Build the final crate-level summaries:
+
+```bash
+python3 scripts/result_analyze.py --experiment-config scripts/config/budgeted.json
+```
+
+The default output is:
+
+```text
+tmp/paper-experiments/final_backend_summaries/budgeted/
+  asan_summary.csv
+  miri_summary.csv
+  fuzz_summary.csv
+  experiment_summary.csv
+```

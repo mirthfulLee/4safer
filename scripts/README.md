@@ -18,7 +18,7 @@ Experiment parameters live under `scripts/config/`.
 - `budgeted.json`: budgeted obligation-driven synthesis experiment, backend execution profiles, and final analysis defaults.
 - `no_ranking.json`: ranking ablation experiment; it matches `budgeted.json` except that `synthesize.cmd_args` also includes `--disable-ranking`.
 
-The JSON files keep shared artifact locations in top-level `paths`, synthesis defaults in `synthesize`, and backend-specific execution profiles in `execute.runs`. Backend execution defaults to one crate at a time; tests, fuzz targets, and Kani proof harnesses can still use per-crate internal parallelism through `test_jobs`, `fuzz_jobs`, and `kani_jobs`. CLI flags still override JSON defaults for one-off reruns.
+The JSON files keep shared artifact roots in top-level `paths`, synthesis defaults in `synthesize`, and backend-specific execution profiles in `execute.runs`. The scripts derive experiment-specific artifacts with the top-level `experiment` name, for example `paths.generation_out/<experiment>/all_results.csv`, `paths.execution_out/<experiment>/...`, and `paths.analysis_out/<experiment>/...`. Backend execution defaults to one crate at a time; tests, fuzz targets, and Kani proof harnesses can still use per-crate internal parallelism through `test_jobs`, `fuzz_jobs`, and `kani_jobs`. CLI flags still override JSON defaults for one-off reruns.
 
 Use `synthesize.cmd_args` for `cargo 4safer` synthesis arguments. The top-level `experiment` names the synthesis profile used in output paths and result rows.
 
@@ -28,7 +28,7 @@ Synthesize the main suites for `misc/trophy_crates.csv`:
 
 ```bash
 python3 scripts/suite_synthesize.py \
-  --experiment obligation-sequence
+  --experiment budgeted
 ```
 
 Run the no-ranking ablation:
@@ -75,7 +75,7 @@ python3 scripts/suite_synthesize.py \
   --sources-dir ../../downloads/popular_crates \
   --out tmp/popular-unsafe-obligation-sequence/generation \
   --skip-fetch \
-  --experiment obligation-sequence \
+  --experiment budgeted \
   --backend tests \
   --backend kani \
   --jobs 16 \
@@ -86,9 +86,9 @@ python3 scripts/suite_synthesize.py \
   --aggregate-existing
 
 python3 scripts/suite_execute.py \
-  --generation-results tmp/popular-unsafe-obligation-sequence/generation/all_results.csv \
+  --generation-results tmp/popular-unsafe-obligation-sequence/generation/budgeted/all_results.csv \
   --out tmp/popular-unsafe-obligation-sequence/backend-execution \
-  --experiment obligation-sequence \
+  --experiment budgeted \
   --backend tests \
   --tests-runner sanitizer \
   --sanitizer memory \
@@ -96,9 +96,9 @@ python3 scripts/suite_execute.py \
   --test-jobs 16
 
 python3 scripts/suite_execute.py \
-  --generation-results tmp/popular-unsafe-obligation-sequence/generation/all_results.csv \
+  --generation-results tmp/popular-unsafe-obligation-sequence/generation/budgeted/all_results.csv \
   --out tmp/popular-unsafe-obligation-sequence/backend-execution \
-  --experiment obligation-sequence \
+  --experiment budgeted \
   --backend tests \
   --tests-runner miri \
   --test-timeout 300 \

@@ -569,15 +569,24 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         target_group: &[usize],
         wrapper_sequence_cap: usize,
     ) -> (Vec<SequencePlan>, Vec<TargetSynthesisSummary>) {
-        let target_allocations = self.allocate_wrapper_target_budgets(
+        let target_budget_allocations = self.allocate_wrapper_target_budgets(
             unsafe_wrapper,
             target_group,
             wrapper_sequence_cap,
         );
+        let generation_target_allocations = target_budget_allocations
+            .iter()
+            .map(|(target_api, allocation)| {
+                let mut allocation = *allocation;
+                allocation.cap = self.generation_budget_for_cap(allocation.cap);
+                (*target_api, allocation)
+            })
+            .collect::<HashMap<_, _>>();
+        let generation_wrapper_sequence_cap = self.generation_budget_for_cap(wrapper_sequence_cap);
         let mut states = target_group
             .iter()
             .filter_map(|&target_api| {
-                let allocation = target_allocations
+                let allocation = generation_target_allocations
                     .get(&target_api)
                     .copied()
                     .unwrap_or_else(|| self.default_target_budget_allocation(target_api));
@@ -601,7 +610,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         {
             let target_api = candidate.sequence.target_api;
 
-            if sequence_cap_reached(wrapper_sequence_cap, wrapper_sequences_accepted) {
+            if sequence_cap_reached(generation_wrapper_sequence_cap, wrapper_sequences_accepted) {
                 if let Some(state) = states.get_mut(&target_api) {
                     state.rejected_candidates_wrapper_sequence_cap += 1;
                 }
@@ -703,7 +712,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 queue.retain(|queued| queued.sequence.target_api != target_api);
                 continue;
             }
-            if sequence_cap_reached(wrapper_sequence_cap, wrapper_sequences_accepted) {
+            if sequence_cap_reached(generation_wrapper_sequence_cap, wrapper_sequences_accepted) {
                 state
                     .stop_reason
                     .get_or_insert("wrapper_sequence_cap_reached");
@@ -763,10 +772,35 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             let Some(mut state) = states.remove(target_api) else {
                 continue;
             };
-            let allocation = target_allocations
+            let allocation = target_budget_allocations
                 .get(target_api)
                 .copied()
                 .unwrap_or_else(|| self.default_target_budget_allocation(*target_api));
+            if !self.ranking_enabled {
+                let target_pool_len = state.accepted_sequences.len();
+                let sample_seed =
+                    self.random_sample_seed(&state.accepted_sequences, *target_api as u64);
+                random_cap_sequence_plans_preserving_predecessors(
+                    &mut state.accepted_sequences,
+                    allocation.cap,
+                    sample_seed,
+                );
+                if state.accepted_sequences.len() < target_pool_len {
+                    info!(
+                        target: "foursafer::planner",
+                        "ranking ablation sampled {} of {} target sequences for `{}` (budget={})",
+                        state.accepted_sequences.len(),
+                        target_pool_len,
+                        self.apis[*target_api].path,
+                        allocation.cap
+                    );
+                    if target_sequence_cap_reached(allocation.cap, state.accepted_sequences.len()) {
+                        state
+                            .stop_reason
+                            .get_or_insert("target_sequence_cap_reached");
+                    }
+                }
+            }
             if state.accepted_sequences.is_empty() {
                 state.stop_reason.get_or_insert("no_base_sequences");
             } else if state.stop_reason.is_none() {
@@ -785,10 +819,10 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                     .count(),
                 base_materialization_failure: state.base_materialization_failure,
                 wrapper_sequence_cap,
-                wrapper_sequences_accepted,
+                wrapper_sequences_accepted: 0,
                 wrapper_target_distance: allocation.distance,
                 wrapper_target_weight: allocation.weight,
-                target_sequence_cap: target_sequence_cap_for_metadata(state.target_sequence_cap),
+                target_sequence_cap: target_sequence_cap_for_metadata(allocation.cap),
                 target_sequences_accepted: state.accepted_sequences.len(),
                 rejected_candidates_wrapper_sequence_cap: state
                     .rejected_candidates_wrapper_sequence_cap,
@@ -807,6 +841,29 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
                 }
                 all_sequences.push(sequence);
             }
+        }
+        if !self.ranking_enabled {
+            let uncapped_len = all_sequences.len();
+            let sample_seed = self.random_sample_seed(&all_sequences, wrapper_sequence_cap as u64);
+            random_cap_sequence_plans_preserving_predecessors(
+                &mut all_sequences,
+                wrapper_sequence_cap,
+                sample_seed,
+            );
+            if all_sequences.len() < uncapped_len {
+                info!(
+                    target: "foursafer::planner",
+                    "ranking ablation sampled {} of {} wrapper sequences for `{}` (budget={})",
+                    all_sequences.len(),
+                    uncapped_len,
+                    unsafe_wrapper,
+                    wrapper_sequence_cap
+                );
+            }
+        }
+        let final_wrapper_sequences_accepted = all_sequences.len();
+        for summary in &mut summaries {
+            summary.wrapper_sequences_accepted = final_wrapper_sequences_accepted;
         }
         (all_sequences, summaries)
     }

@@ -156,7 +156,7 @@ pub struct FourSaferArgs {
         display_order = 20
     )]
     pub wrapper_target_max_distance: f32,
-    /// Disable heuristic sequence ranking and accept candidates in generation order.
+    /// Disable heuristic sequence ranking and random-sample from a larger candidate pool.
     #[arg(
         long = "disable-ranking",
         help_heading = "Core Options",

@@ -25,48 +25,22 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from experiment_common import (
+    DEFAULT_EXPERIMENT,
+    DEFAULT_EXPERIMENT_ROOT,
+    REPO,
+    load_experiment_configs,
+    repo_path,
+)
 
-REPO = Path(__file__).resolve().parents[1]
 DEFAULT_CSV = REPO / "misc/selected_crates.csv"
-DEFAULT_SOURCES = REPO / "tmp/paper-experiments/sources"
-DEFAULT_OUT = REPO / "tmp/paper-experiments/runs"
+DEFAULT_SOURCES = DEFAULT_EXPERIMENT_ROOT / "sources"
+DEFAULT_OUT = DEFAULT_EXPERIMENT_ROOT / "runs"
 BIN = REPO / "target/debug/cargo-4safer"
 
 BACKENDS = ("kani", "tests", "fuzz")
 BACKEND_CHOICES = (*BACKENDS, "all")
-EXPERIMENT_CONFIG_FILES = (
-    REPO / "scripts/config/budgeted.json",
-    REPO / "scripts/config/no_ranking.json",
-)
-
-
-def load_experiment_config(path):
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-
-    experiment = payload.get("experiment")
-    paths = payload.get("paths", {})
-    synthesize = payload.get("synthesize", {})
-    if not isinstance(experiment, str) or not experiment:
-        raise ValueError(f"{path} must define a non-empty experiment name")
-    if not isinstance(paths, dict):
-        raise ValueError(f"{path} paths must be an object when present")
-    if not isinstance(synthesize, dict):
-        raise ValueError(f"{path} synthesize must be an object when present")
-    return experiment, {"paths": paths, "synthesize": synthesize}
-
-
-def load_experiments():
-    experiments = {}
-    for path in EXPERIMENT_CONFIG_FILES:
-        experiment, config = load_experiment_config(path)
-        if experiment in experiments:
-            raise ValueError(f"duplicate experiment definition: {experiment}")
-        experiments[experiment] = config
-    return experiments
-
-
-EXPERIMENTS = load_experiments()
+EXPERIMENTS = load_experiment_configs()
 
 
 def load_selected_crates(csv_path):
@@ -110,43 +84,12 @@ def ensure_source(sources_dir, crate, fetch):
 
 
 def apply_source_preprocessing(source_dir, crate):
-    steps = []
     ensure_rustc_tmp_dir(source_dir)
-    steps.append("ensure-rustc-target-tmp-dir")
-    if crate["crate"] == "hyper" and crate["version"] == "0.10.4":
-        if preprocess_hyper_0_10_4(source_dir):
-            steps.append("hyper-0.10.4-disable-deprecated-impl-attr")
-        else:
-            steps.append("hyper-0.10.4-disable-deprecated-impl-attr-already-applied")
-    return steps
+    return ["ensure-rustc-target-tmp-dir"]
 
 
 def ensure_rustc_tmp_dir(source_dir):
     (source_dir / "target" / "tmp").mkdir(parents=True, exist_ok=True)
-
-
-def preprocess_hyper_0_10_4(source_dir):
-    lib_rs = source_dir / "src" / "lib.rs"
-    text = lib_rs.read_text()
-    original = """macro_rules! deprecated {
-    (#[$note:meta] $i:item) => (
-        #[cfg_attr(has_deprecated, $note)]
-        $i
-    );
-}
-"""
-    patched = """macro_rules! deprecated {
-    (#[$note:meta] $i:item) => (
-        $i
-    );
-}
-"""
-    if patched in text:
-        return False
-    if original not in text:
-        raise RuntimeError("hyper 0.10.4 deprecated! macro did not match expected source")
-    lib_rs.write_text(text.replace(original, patched))
-    return True
 
 
 def fetch_crate_source(sources_dir, crate):
@@ -787,6 +730,17 @@ def summarize(rows, out_dir):
     write_markdown(out_dir / "summary.md", grouped)
 
 
+def summarize_experiments(rows, out_dir):
+    rows = [normalize_result(row) for row in rows]
+    groups = defaultdict(list)
+    for row in rows:
+        experiment = row.get("experiment")
+        if experiment:
+            groups[experiment].append(row)
+    for experiment, group in groups.items():
+        summarize(group, out_dir / experiment)
+
+
 def summarize_slices(rows, out_dir):
     rows = [normalize_result(row) for row in rows]
     groups = defaultdict(list)
@@ -951,15 +905,6 @@ def selected_backends(args):
     return backends
 
 
-def resolve_repo_path(value, default):
-    if value is None:
-        return default
-    path = Path(value)
-    if path.is_absolute():
-        return path
-    return REPO / path
-
-
 def shared_synthesize_setting(experiments, key, default=None):
     values = []
     for experiment in experiments:
@@ -999,17 +944,17 @@ def shared_path_or_synthesize_setting(experiments, path_key, synthesize_key=None
 
 def apply_synthesize_defaults(args, experiments):
     if args.csv is None:
-        args.csv = resolve_repo_path(
+        args.csv = repo_path(
             shared_path_or_synthesize_setting(experiments, "csv"),
             DEFAULT_CSV,
         )
     if args.sources_dir is None:
-        args.sources_dir = resolve_repo_path(
+        args.sources_dir = repo_path(
             shared_path_or_synthesize_setting(experiments, "sources_dir"),
             DEFAULT_SOURCES,
         )
     if args.out is None:
-        args.out = resolve_repo_path(
+        args.out = repo_path(
             shared_path_or_synthesize_setting(experiments, "generation_out", "out"),
             DEFAULT_OUT,
         )
@@ -1064,7 +1009,7 @@ def main():
         choices=sorted(EXPERIMENTS),
         action="append",
         default=[],
-        help="Experiment suite to run. Defaults to obligation-sequence.",
+        help="Experiment suite to run. Defaults to the first loaded config.",
     )
     parser.add_argument(
         "--backend",
@@ -1104,7 +1049,8 @@ def main():
     parser.add_argument("--aggregate-existing", action="store_true")
     args = parser.parse_args()
 
-    experiments = args.experiment or ["obligation-sequence"]
+    default_experiment = DEFAULT_EXPERIMENT if DEFAULT_EXPERIMENT in EXPERIMENTS else next(iter(sorted(EXPERIMENTS)))
+    experiments = args.experiment or [default_experiment]
     try:
         apply_synthesize_defaults(args, experiments)
     except ValueError as error:
@@ -1117,6 +1063,7 @@ def main():
     if args.aggregate_existing:
         rows = gather_existing_results(args.out)
         summarize(rows, args.out)
+        summarize_experiments(rows, args.out)
         summarize_slices(rows, args.out)
         return 0
 
@@ -1149,6 +1096,7 @@ def main():
             rows.extend(crate_rows)
             if rows and not args.dry_run:
                 summarize(rows, args.out)
+                summarize_experiments(rows, args.out)
                 summarize_slices(rows, args.out)
     else:
         with ThreadPoolExecutor(max_workers=jobs) as executor:
@@ -1174,11 +1122,13 @@ def main():
                 if rows and not args.dry_run:
                     existing = gather_existing_results(args.out)
                     summarize(existing, args.out)
+                    summarize_experiments(existing, args.out)
                     summarize_slices(existing, args.out)
 
     if rows and not args.dry_run:
         final_rows = gather_existing_results(args.out) if jobs > 1 else rows
         summarize(final_rows, args.out)
+        summarize_experiments(final_rows, args.out)
         summarize_slices(final_rows, args.out)
     return 0
 

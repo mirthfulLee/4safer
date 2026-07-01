@@ -17,11 +17,11 @@ import matplotlib
 matplotlib.use("pdf")
 import matplotlib.pyplot as plt
 
+from experiment_common import DEFAULT_EXPERIMENT, DEFAULT_EXPERIMENT_ROOT, REPO
 
-REPO = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT = REPO / "tmp/paper-experiments/runs/budgeted/tests"
+DEFAULT_INPUT = DEFAULT_EXPERIMENT_ROOT / "runs" / DEFAULT_EXPERIMENT / "tests"
 DEFAULT_CSV = REPO / "misc/trophy_crates.csv"
-DEFAULT_OUT = REPO / "tmp/paper-experiments/runs/sequence_length_distribution.pdf"
+DEFAULT_OUT = DEFAULT_EXPERIMENT_ROOT / "runs" / "sequence_length_distribution.pdf"
 
 COLORS = {
     1: "#4E79A7",

@@ -23,57 +23,35 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from experiment_common import (
+    DEFAULT_EXPERIMENT,
+    DEFAULT_EXPERIMENT_CONFIG,
+    DEFAULT_EXPERIMENT_ROOT,
+    REPO,
+    configured_path,
+    generation_results_path,
+    load_experiment_config,
+    repo_path,
+)
 
-REPO = Path(__file__).resolve().parents[1]
-DEFAULT_GENERATION = REPO / "tmp/paper-experiments/runs/all_results.csv"
-DEFAULT_OUT = REPO / "tmp/paper-experiments/backend-execution"
-DEFAULT_KANI_REPO = "git@github.com:mirthfulLee/varies_kani.git"
-if "FOURSAFER_KANI_DIR" in os.environ:
-    DEFAULT_FOURSAFER_KANI_DIR = Path(os.environ["FOURSAFER_KANI_DIR"])
-else:
-    DEFAULT_FOURSAFER_KANI_DIR = REPO.parent / "varies_root/varies_kani"
-if not DEFAULT_FOURSAFER_KANI_DIR.exists():
-    DEFAULT_FOURSAFER_KANI_DIR = REPO / "tmp/paper-experiments/tools/varies_kani"
+DEFAULT_GENERATION = DEFAULT_EXPERIMENT_ROOT / "runs" / DEFAULT_EXPERIMENT / "all_results.csv"
+DEFAULT_OUT = DEFAULT_EXPERIMENT_ROOT / "backend-execution"
+DEFAULT_KANI_REPO = "https://github.com/model-checking/kani.git"
+DEFAULT_KANI_DIR = repo_path(
+    os.environ.get("KANI_DIR"),
+    DEFAULT_EXPERIMENT_ROOT / "tools" / "kani",
+)
 BACKENDS = ("tests", "fuzz", "kani")
 AFL_LEGACY_SAFE_SEED_GUARD = '        if data == b"\\0" {\n            return;\n        }\n'
 AFL_FUZZ_ENTRY = "    afl::fuzz!(|data: &[u8]| {\n"
 FUZZ_CRASH_REPLAY_TIMEOUT = 10
-DEFAULT_EXPERIMENT_CONFIG = REPO / "scripts/config/budgeted.json"
+FUZZ_SEED_VALIDATION_TIMEOUT = 10
 
 
-def load_experiment_config(path):
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        raise ValueError(f"{path} must contain a JSON object")
-    return payload
-
-
-def repo_path(value, default=None):
-    if value is None:
-        return default
-    path = Path(value)
-    if path.is_absolute():
-        return path
-    return REPO / path
-
-
-def configured_path(config, key, default=None):
-    paths = config.get("paths", {})
-    if not isinstance(paths, dict):
-        raise ValueError(f"{DEFAULT_EXPERIMENT_CONFIG} paths must be an object")
-    return repo_path(paths.get(key), default)
-
-
-def configured_generation_results(config, execute):
+def configured_generation_results(config, execute, experiment):
     if execute.get("generation_results") is not None:
         return repo_path(execute.get("generation_results"), DEFAULT_GENERATION)
-    if configured_path(config, "generation_results") is not None:
-        return configured_path(config, "generation_results")
-    generation_out = configured_path(config, "generation_out")
-    if generation_out is not None:
-        return generation_out / "all_results.csv"
-    return DEFAULT_GENERATION
+    return generation_results_path(config, experiment, DEFAULT_GENERATION)
 
 
 def apply_run_defaults(args, require_backend=True):
@@ -93,12 +71,12 @@ def apply_run_defaults(args, require_backend=True):
     if not isinstance(run, dict):
         raise ValueError(f"{args.experiment_config} execute run {args.run!r} must be an object")
 
+    if args.experiment is None:
+        args.experiment = config.get("experiment") or DEFAULT_EXPERIMENT
     if args.generation_results is None:
-        args.generation_results = configured_generation_results(config, execute)
+        args.generation_results = configured_generation_results(config, execute, args.experiment)
     if args.out is None:
         args.out = repo_path(execute.get("out"), configured_path(config, "execution_out", DEFAULT_OUT))
-    if args.experiment is None:
-        args.experiment = config.get("experiment") or "obligation-sequence"
     if args.config is None:
         args.config = run.get("config") or args.experiment
     args.kani_verify_cmd = run.get("verify_cmd") or execute.get("verify_cmd")
@@ -125,11 +103,12 @@ def apply_run_defaults(args, require_backend=True):
         if getattr(args, name) is None:
             setattr(args, name, run.get(name, default))
     if args.kani_dir is None:
-        args.kani_dir = repo_path(run.get("kani_dir"), DEFAULT_FOURSAFER_KANI_DIR)
+        args.kani_dir = repo_path(run.get("kani_dir"), DEFAULT_KANI_DIR)
     for name in (
         "force",
         "keep_target",
         "prepare_package_tmp",
+        "fuzz_exit_when_done",
         "fuzz_stop_on_ub",
         "reuse_fuzz_target_results",
         "build_kani",
@@ -146,10 +125,11 @@ def default_bool_for_execution_flag(name):
         "force": False,
         "keep_target": False,
         "prepare_package_tmp": True,
+        "fuzz_exit_when_done": False,
         "fuzz_stop_on_ub": True,
         "reuse_fuzz_target_results": True,
         "build_kani": False,
-        "prepare_kani": True,
+        "prepare_kani": False,
     }[name]
 
 
@@ -186,6 +166,8 @@ def main():
     parser.add_argument("--fuzz-jobs", type=int, help="Number of fuzz targets to execute in parallel per crate.")
     parser.add_argument("--fuzz-time-limit", type=int, help="Per-fuzz-target AFL -V time limit in seconds; 0 means use --timeout.")
     parser.add_argument("--fuzz-target-timeout", type=int, help="Outer timeout in seconds for each fuzz target command; 0 means AFL -V time plus 600s.")
+    parser.add_argument("--fuzz-exit-when-done", action="store_true", default=None, help="Set AFL_EXIT_WHEN_DONE=1 so AFL can stop after exhausting its queue before -V.")
+    parser.add_argument("--no-fuzz-exit-when-done", dest="fuzz_exit_when_done", action="store_false")
     parser.add_argument("--fuzz-stop-on-ub", action="store_true", default=None, help="Stop the current fuzz target early after the first high-confidence UB finding.")
     parser.add_argument("--no-fuzz-stop-on-ub", dest="fuzz_stop_on_ub", action="store_false")
     parser.add_argument("--reuse-fuzz-target-results", action="store_true", default=None, help="When rerunning with --force, reuse existing non-skipped fuzz target results and only execute missing/skipped targets.")
@@ -207,12 +189,12 @@ def main():
     parser.add_argument(
         "--kani-command",
         default=None,
-        help="Kani wrapper command for codegen/proof mode, or override for the first verify_cmd token.",
+        help="Kani command for codegen/proof mode, or override for the first verify_cmd token.",
     )
     parser.add_argument("--kani-repo")
     parser.add_argument("--kani-dir", type=Path)
     parser.add_argument("--build-kani", action="store_true", default=None)
-    parser.add_argument("--prepare-kani", action="store_true", default=None)
+    parser.add_argument("--prepare-kani", action="store_true", default=None, help="Clone/build Kani under --kani-dir and prepend its cargo-kani to PATH.")
     parser.add_argument("--no-prepare-kani", dest="prepare_kani", action="store_false")
     parser.add_argument("--kani-jobs", type=int, help="Number of Kani proof harnesses to execute in parallel per crate.")
     parser.add_argument("--kani-proof-timeout", type=int, help="Per-Kani-proof timeout in seconds for --kani-mode official-proof.")
@@ -234,6 +216,7 @@ def main():
     if args.aggregate_existing:
         rows = gather_existing_results(args.out)
         write_summaries(rows, args.out)
+        write_experiment_summaries(rows, args.out)
         return 0
 
     if args.backend is None:
@@ -257,10 +240,14 @@ def main():
         if row is not None:
             rows.append(row)
             if not args.dry_run:
-                write_summaries(gather_existing_results(args.out), args.out)
+                existing = gather_existing_results(args.out)
+                write_summaries(existing, args.out)
+                write_experiment_summaries(existing, args.out)
 
     if rows and not args.dry_run:
-        write_summaries(gather_existing_results(args.out), args.out)
+        existing = gather_existing_results(args.out)
+        write_summaries(existing, args.out)
+        write_experiment_summaries(existing, args.out)
     return 0
 
 
@@ -333,7 +320,10 @@ def run_backend(generation, args):
     if args.backend == "tests" and args.tests_runner == "miri":
         env["MIRIFLAGS"] = append_space_flag(env.get("MIRIFLAGS"), "-Zmiri-ignore-leaks")
     if args.backend == "fuzz":
-        env["AFL_EXIT_WHEN_DONE"] = "1"
+        if args.fuzz_exit_when_done:
+            env["AFL_EXIT_WHEN_DONE"] = "1"
+        else:
+            env.pop("AFL_EXIT_WHEN_DONE", None)
         env["AFL_NO_AFFINITY"] = "1"
         sanitizer = selected_fuzz_sanitizer(args)
         if sanitizer:
@@ -515,7 +505,7 @@ def backend_command(args, manifest):
         if args.kani_mode == "config":
             command = configured_kani_command(args)
         else:
-            command = [args.kani_command or "cargo-4safer-kani"]
+            command = [args.kani_command or "cargo-kani"]
             if args.kani_mode == "codegen":
                 command.append("--only-codegen")
         if "--manifest-path" not in command and not any(
@@ -548,7 +538,7 @@ def command_backend_name(command):
         return "tests"
     if len(command) >= 2 and command[:2] == ["cargo", "kani"]:
         return "kani"
-    if command and Path(command[0]).name == "cargo-4safer-kani":
+    if command and Path(command[0]).name == "cargo-kani":
         return "kani"
     if len(command) >= 3 and command[:3] == ["cargo", "afl", "fuzz"]:
         return "fuzz"
@@ -572,16 +562,13 @@ def prepare_kani(args):
             ["git", "clone", args.kani_repo, str(source)],
             check=True,
         )
-    wrapper = source / "scripts" / "cargo-4safer-kani"
-    if not wrapper.exists():
-        raise RuntimeError(f"missing varies_kani wrapper: {wrapper}")
     cargo_kani = source / "target" / "kani" / "bin" / "cargo-kani"
     if args.build_kani:
         subprocess.run(["cargo", "build-dev", "--", "--release"], cwd=source, check=True)
     elif not cargo_kani.exists():
         raise RuntimeError(
-            f"missing varies_kani cargo-kani binary: {cargo_kani}. "
-            "Run with --build-kani or build varies_kani before the experiment."
+            f"missing cargo-kani binary: {cargo_kani}. "
+            "Run with --build-kani or point KANI_DIR at a built Kani checkout."
         )
 
 def apply_kani_env(args, env):
@@ -791,7 +778,7 @@ def validate_fuzz_seed_candidates(binary, harness, env, candidates):
             cwd=harness,
             env=env,
             stdin_bytes=data,
-            timeout=None,
+            timeout=FUZZ_SEED_VALIDATION_TIMEOUT,
         )
         status = "timeout" if timed_out else "ok" if exit_code == 0 else "crash"
         row = {
@@ -880,6 +867,7 @@ def run_fuzz_backend(generation, args, run_dir, harness, manifest, env):
         "fuzz_target_timeout_sec": fuzz_outer_timeout(args, fuzz_target_time_limit(args)),
         "fuzz_time_limit_sec": fuzz_target_time_limit(args),
         "fuzz_jobs": args.fuzz_jobs,
+        "fuzz_exit_when_done": args.fuzz_exit_when_done,
         "fuzz_stop_on_ub": args.fuzz_stop_on_ub,
         "fuzz_targets_mode": args.fuzz_targets,
         "fuzz_sanitizer": selected_fuzz_sanitizer(args),
@@ -1213,6 +1201,7 @@ def run_fuzz_command(
         stderr=stderr,
         start_new_session=True,
     )
+    process_started_at = process_start_time(process.pid)
     monitor_stop = threading.Event()
     early_stop_info = {}
     monitor = None
@@ -1227,7 +1216,7 @@ def run_fuzz_command(
         exit_code = process.wait(timeout=timeout)
         completed = subprocess.CompletedProcess(command, exit_code)
     except subprocess.TimeoutExpired:
-        kill_process_group(process)
+        kill_process_tree(process, process_started_at)
         raise
     finally:
         monitor_stop.set()
@@ -1262,7 +1251,7 @@ def monitor_fuzz_crashes_for_ub(process, binary, cwd, env, afl_output_dir, stop_
                     "replay_stderr_tail": replay["stderr_tail"],
                 }
             )
-            kill_process_group(process)
+            kill_process_tree(process)
             return
         stop_event.wait(1)
 
@@ -1955,11 +1944,12 @@ def run_command(command, cwd, env, stdout, stderr, timeout):
         stderr=stderr,
         start_new_session=True,
     )
+    process_started_at = process_start_time(process.pid)
     try:
         exit_code = process.wait(timeout=timeout)
         return subprocess.CompletedProcess(command, exit_code)
     except subprocess.TimeoutExpired:
-        kill_process_group(process)
+        kill_process_tree(process, process_started_at)
         raise
 
 
@@ -1974,11 +1964,12 @@ def run_command_capture(command, cwd, env, timeout):
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    process_started_at = process_start_time(process.pid)
     try:
         captured_stdout, captured_stderr = process.communicate(timeout=timeout)
         return process.returncode, captured_stdout, captured_stderr, False
     except subprocess.TimeoutExpired:
-        kill_process_group(process)
+        kill_process_tree(process, process_started_at)
         captured_stdout, captured_stderr = process.communicate()
         return -999, captured_stdout, captured_stderr, True
 
@@ -1995,23 +1986,99 @@ def run_command_with_stdin_capture(command, cwd, env, stdin_bytes, timeout):
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    process_started_at = process_start_time(process.pid)
     try:
         captured_stdout, captured_stderr = process.communicate(
             input=stdin_bytes, timeout=timeout
         )
         return process.returncode, captured_stdout, captured_stderr, False
     except subprocess.TimeoutExpired:
-        kill_process_group(process)
+        kill_process_tree(process, process_started_at)
         captured_stdout, captured_stderr = process.communicate()
         return -999, captured_stdout, captured_stderr, True
 
 
 def kill_process_group(process):
+    kill_process_tree(process)
+
+
+def kill_process_tree(process, process_started_at=None):
+    descendants = process_descendants(process.pid)
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    process.wait()
+    for pid in sorted(descendants, reverse=True):
+        if process_started_at is not None and not process_is_same_or_newer(pid, process_started_at):
+            continue
+        kill_pid(pid)
+    kill_pid(process.pid)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        kill_pid(process.pid)
+        process.wait()
+
+
+def process_descendants(root_pid):
+    children = defaultdict(list)
+    for pid in proc_pids():
+        ppid = proc_ppid(pid)
+        if ppid is not None:
+            children[ppid].append(pid)
+
+    descendants = set()
+    stack = list(children.get(root_pid, []))
+    while stack:
+        pid = stack.pop()
+        if pid in descendants:
+            continue
+        descendants.add(pid)
+        stack.extend(children.get(pid, []))
+    return descendants
+
+
+def proc_pids():
+    proc = Path("/proc")
+    if not proc.exists():
+        return []
+    return [int(path.name) for path in proc.iterdir() if path.name.isdigit()]
+
+
+def proc_ppid(pid):
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        return int(stat.rsplit(") ", 1)[1].split()[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def process_start_time(pid):
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        return int(stat.rsplit(") ", 1)[1].split()[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def process_is_same_or_newer(pid, started_at):
+    current_started_at = process_start_time(pid)
+    return current_started_at is not None and current_started_at >= started_at
+
+
+def kill_pid(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        pass
 
 
 def discover_test_binary(stdout_path, target_dir):
@@ -2407,6 +2474,16 @@ def write_summaries(rows, out_dir):
     write_json(out_dir / "unsoundness_cases.json", unsoundness_cases)
     write_csv(out_dir / "unsoundness_cases.csv", unsoundness_cases)
     write_unsoundness_markdown(out_dir / "unsoundness_cases.md", unsoundness_cases)
+
+
+def write_experiment_summaries(rows, out_dir):
+    groups = defaultdict(list)
+    for row in rows:
+        experiment = row.get("experiment")
+        if experiment:
+            groups[experiment].append(row)
+    for experiment, group in groups.items():
+        write_summaries(group, out_dir / experiment)
 
 
 def summarize(rows):

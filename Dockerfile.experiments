@@ -4,13 +4,11 @@ FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUST_TOOLCHAIN=nightly-2026-03-26
-ARG KANI_TOOLCHAIN=nightly-2025-10-23
 
 ENV RUSTUP_HOME=/workspace_home/.rustup
 ENV CARGO_HOME=/workspace_home/.cargo
-ENV CARGO_KANI_TOOLCHAIN=${KANI_TOOLCHAIN}-x86_64-unknown-linux-gnu
-ENV FOURSAFER_KANI_DIR=/opt/varies_kani
-ENV PATH=/opt/varies_kani/scripts:/opt/varies_kani/target/kani/bin:/workspace_home/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV KANI_DIR=/opt/kani
+ENV PATH=/opt/kani/target/kani/bin:/workspace_home/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 RUN apt-get update && \
     apt-get install --no-install-recommends --yes \

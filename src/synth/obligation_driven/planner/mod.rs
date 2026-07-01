@@ -23,7 +23,7 @@ use log::{debug, info};
 use rustc_middle::ty::{self, Ty, TyCtxt, TyKind};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_TOP_K_CANDIDATES: usize = 8;
 const DEFAULT_MONO_TARGETS_PER_GENERIC_FUNCTION: usize = 4;
@@ -42,6 +42,9 @@ const DIVERSITY_PENALTY_WEIGHT: f32 = 0.2;
 const DEPTH_SATURATION_WEIGHT: f32 = 0.25;
 const STAGNATION_SEQUENCE_THRESHOLD: f32 = 0.5;
 const STAGNATION_DEPTH_WEIGHT: f32 = 0.5;
+const RANKING_ABLATION_GENERATION_MULTIPLIER: usize = 10;
+const RANKING_ABLATION_RANDOM_SEED_ENV: &str = "FOURSAFER_DISABLE_RANKING_SEED";
+const DEFAULT_RANKING_ABLATION_RANDOM_SEED: u64 = 0x4f44_5241_4e44_4f4d;
 
 #[derive(Clone, Copy, Debug)]
 struct PlannerCaps {
@@ -176,6 +179,7 @@ pub(crate) struct Planner<'tcx, 'a> {
     reuse_penalty_enabled: bool,
     depth_penalty_enabled: bool,
     ranking_enabled: bool,
+    ranking_ablation_random_seed: u64,
     caps: PlannerCaps,
     tuning: PlannerTuning,
 }
@@ -308,6 +312,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             reuse_penalty_enabled,
             depth_penalty_enabled,
             ranking_enabled,
+            ranking_ablation_random_seed: ranking_ablation_random_seed(),
             caps: PlannerCaps::from_config(floor_sequences_per_target),
             tuning: PlannerTuning::from_config(r_flow, cost_weight, diversity_penalty_weight),
         }
@@ -321,7 +326,7 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
             target_groups.len()
         );
 
-        // Phase 3: obligation-driven sequence synthesis.
+        // Phase 3: unsafe-flow-guided sequence synthesis.
         let mut sequences = Vec::new();
         let mut target_summaries = Vec::new();
         for (unsafe_wrapper, target_group) in target_groups {
@@ -353,10 +358,14 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
         if !self.ranking_enabled {
             if self.max_sequences != 0 && sequences.len() > self.max_sequences {
                 let uncapped_len = sequences.len();
-                truncate_sequence_plans_preserving_order(sequences, self.max_sequences);
+                random_cap_sequence_plans_preserving_predecessors(
+                    sequences,
+                    self.max_sequences,
+                    self.random_sample_seed(sequences, self.max_sequences as u64),
+                );
                 info!(
                     target: "foursafer::planner",
-                    "global suite sequence cap retained {} of {} sequences (limit={})",
+                    "ranking ablation sampled {} of {} global sequences (budget={})",
                     sequences.len(),
                     uncapped_len,
                     self.max_sequences
@@ -393,6 +402,56 @@ impl<'tcx, 'a> Planner<'tcx, 'a> {
     }
 
     pub(super) fn sequence_generation_limit(&self) -> Option<usize> {
-        (self.max_sequences != 0).then_some(self.max_sequences)
+        (self.max_sequences != 0).then(|| self.generation_budget_for_cap(self.max_sequences))
+    }
+
+    pub(super) fn generation_budget_for_cap(&self, cap: usize) -> usize {
+        if self.ranking_enabled || cap == 0 || cap == usize::MAX {
+            return cap;
+        }
+        cap.saturating_mul(RANKING_ABLATION_GENERATION_MULTIPLIER)
+    }
+
+    pub(super) fn random_sample_seed(&self, sequences: &[SequencePlan], salt: u64) -> u64 {
+        let signature_salt = sequences.iter().fold(salt, |acc, sequence| {
+            acc.rotate_left(7) ^ sequence_signature(&sequence.steps)
+        });
+        normalize_random_seed(self.ranking_ablation_random_seed ^ signature_salt)
+    }
+}
+
+fn ranking_ablation_random_seed() -> u64 {
+    if let Ok(value) = env::var(RANKING_ABLATION_RANDOM_SEED_ENV) {
+        return normalize_random_seed(parse_u64_seed(&value).unwrap_or_else(|| {
+            panic!("{RANKING_ABLATION_RANDOM_SEED_ENV} must be a decimal or hex u64 seed")
+        }));
+    }
+
+    let time_seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(DEFAULT_RANKING_ABLATION_RANDOM_SEED);
+    normalize_random_seed(
+        time_seed ^ ((std::process::id() as u64) << 32) ^ DEFAULT_RANKING_ABLATION_RANDOM_SEED,
+    )
+}
+
+fn parse_u64_seed(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<u64>().ok()
+    }
+}
+
+fn normalize_random_seed(seed: u64) -> u64 {
+    if seed == 0 {
+        DEFAULT_RANKING_ABLATION_RANDOM_SEED
+    } else {
+        seed
     }
 }

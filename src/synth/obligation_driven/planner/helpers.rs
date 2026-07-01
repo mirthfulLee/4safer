@@ -1081,22 +1081,113 @@ pub(super) fn cap_sequence_plans_preserving_predecessors(
     index_map
 }
 
-pub(super) fn truncate_sequence_plans_preserving_order(
+pub(super) fn random_cap_sequence_plans_preserving_predecessors(
     sequences: &mut Vec<SequencePlan>,
     limit: usize,
-) {
-    if sequences.len() <= limit {
+    seed: u64,
+) -> HashMap<usize, usize> {
+    if limit == 0 || sequences.len() <= limit {
+        return (0..sequences.len()).map(|index| (index, index)).collect();
+    }
+
+    let mut ranked = (0..sequences.len()).collect::<Vec<_>>();
+    shuffle_indices(&mut ranked, seed);
+
+    let mut selected_set = HashSet::new();
+    let mut selected = Vec::new();
+    for index in ranked {
+        let mut chain = Vec::new();
+        let mut cursor = Some(index);
+        while let Some(current) = cursor {
+            if selected_set.contains(&current) {
+                break;
+            }
+            chain.push(current);
+            cursor = sequences[current].predecessor;
+        }
+        chain.reverse();
+        let missing = chain
+            .into_iter()
+            .filter(|current| !selected_set.contains(current))
+            .collect::<Vec<_>>();
+        if selected_set.len() + missing.len() > limit {
+            continue;
+        }
+        for current in missing {
+            if selected_set.insert(current) {
+                selected.push(current);
+            }
+        }
+        if selected_set.len() >= limit {
+            break;
+        }
+    }
+
+    selected.sort_unstable();
+
+    let index_map = selected
+        .iter()
+        .enumerate()
+        .map(|(new_index, old_index)| (*old_index, new_index))
+        .collect::<HashMap<_, _>>();
+    let mut capped = selected
+        .into_iter()
+        .map(|old_index| sequences[old_index].clone())
+        .collect::<Vec<_>>();
+
+    for sequence in &mut capped {
+        sequence.predecessor = sequence
+            .predecessor
+            .and_then(|old| index_map.get(&old).copied());
+        sequence.successor = sequence
+            .successor
+            .iter()
+            .filter_map(|old| index_map.get(old).copied())
+            .collect();
+    }
+
+    *sequences = capped;
+    index_map
+}
+
+fn shuffle_indices(indices: &mut [usize], seed: u64) {
+    if indices.len() < 2 {
         return;
     }
-    sequences.truncate(limit);
-    for sequence in sequences {
-        if sequence
-            .predecessor
-            .is_some_and(|predecessor| predecessor >= limit)
-        {
-            sequence.predecessor = None;
+
+    let mut rng = XorShift64::new(seed);
+    for index in (1..indices.len()).rev() {
+        let swap_with = rng.next_usize(index + 1);
+        indices.swap(index, swap_with);
+    }
+}
+
+struct XorShift64 {
+    state: u64,
+}
+
+impl XorShift64 {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
         }
-        sequence.successor.retain(|successor| *successor < limit);
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut value = self.state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.state = value;
+        value
+    }
+
+    fn next_usize(&mut self, upper_bound: usize) -> usize {
+        (self.next_u64() % upper_bound as u64) as usize
     }
 }
 
@@ -1178,8 +1269,8 @@ pub(super) fn extend_available_ty_variants<'tcx>(
 #[cfg(test)]
 mod tests {
     use super::{
-        earliest_mutator_insertion_index, required_fields_before_call,
-        truncate_sequence_plans_preserving_order,
+        earliest_mutator_insertion_index, random_cap_sequence_plans_preserving_predecessors,
+        required_fields_before_call,
     };
     use crate::synth::{CallStep, SequencePlan};
     use crate::unsafe_analysis::FieldSet;
@@ -1281,21 +1372,27 @@ mod tests {
     }
 
     #[test]
-    fn order_truncation_drops_links_to_removed_sequences() {
+    fn random_cap_preserves_budget_and_rewrites_links() {
         let mut sequences = vec![
             test_sequence(0, None),
-            test_sequence(1, Some(2)),
-            test_sequence(2, None),
+            test_sequence(1, Some(0)),
+            test_sequence(2, Some(1)),
+            test_sequence(3, None),
         ];
-        sequences[0].successor = vec![1, 2];
+        sequences[0].successor = vec![1];
         sequences[1].successor = vec![2];
 
-        truncate_sequence_plans_preserving_order(&mut sequences, 2);
+        random_cap_sequence_plans_preserving_predecessors(&mut sequences, 2, 0x4);
 
         assert_eq!(sequences.len(), 2);
-        assert_eq!(sequences[0].successor, vec![1]);
-        assert_eq!(sequences[1].predecessor, None);
-        assert!(sequences[1].successor.is_empty());
+        for sequence in &sequences {
+            assert!(
+                sequence
+                    .predecessor
+                    .is_none_or(|predecessor| predecessor < 2)
+            );
+            assert!(sequence.successor.iter().all(|successor| *successor < 2));
+        }
     }
 
     fn test_sequence(target_api: usize, predecessor: Option<usize>) -> SequencePlan {

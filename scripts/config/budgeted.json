@@ -5,7 +5,6 @@
     "sources_dir": "tmp/paper-experiments/sources",
     "generation_out": "tmp/paper-experiments/runs",
     "execution_out": "tmp/paper-experiments/backend-execution",
-    "unsoundness_cases": "tmp/paper-experiments/backend-execution/unsoundness_cases.csv",
     "analysis_out": "tmp/paper-experiments/final_backend_summaries"
   },
   "synthesize": {
@@ -34,7 +33,7 @@
         "backend": "kani",
         "kani_mode": "config",
         "verify_cmd": [
-          "cargo-4safer-kani",
+          "cargo-kani",
           "--output-format",
           "terse",
           "--default-unwind",
@@ -50,7 +49,7 @@
           "-Z",
           "concrete-playback",
           "--jobs",
-          "2",
+          "4",
           "--harness-timeout",
           "20m"
         ],
@@ -74,8 +73,9 @@
         "fuzz_sanitizer": "address",
         "fuzz_targets": "all",
         "fuzz_jobs": 64,
-        "fuzz_time_limit": 6000,
-        "fuzz_target_timeout": 6100,
+        "fuzz_time_limit": 3600,
+        "fuzz_target_timeout": 3600,
+        "fuzz_exit_when_done": false,
         "fuzz_stop_on_ub": true,
         "force": true
       }
@@ -85,7 +85,8 @@
     "generation_backend": "tests",
     "run_backends": {
       "asan": "tests-asan",
-      "miri": "tests-miri"
+      "miri": "tests-miri",
+      "fuzz": "fuzz-asan"
     }
   }
 }
